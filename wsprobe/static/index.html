@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>wsprobe</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b98a8;
+      --accent: #3d8bfd;
+      --ok: #3fb950;
+      --err: #f85149;
+      --border: #30363d;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .wrap { max-width: 52rem; margin: 0 auto; padding: 1.5rem 1.25rem 3rem; }
+    h1 { font-size: 1.35rem; font-weight: 600; margin: 0 0 0.5rem; }
+    .lead { color: var(--muted); font-size: 0.95rem; margin: 0 0 1.5rem; }
+    .warn {
+      background: #21262d;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      font-size: 0.88rem;
+      color: var(--muted);
+      margin-bottom: 1.5rem;
+    }
+    section {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem 1.1rem;
+      margin-bottom: 1rem;
+    }
+    section h2 { font-size: 0.95rem; font-weight: 600; margin: 0 0 0.75rem; color: #c9d1d9; }
+    label { display: block; font-size: 0.8rem; color: var(--muted); margin-bottom: 0.25rem; }
+    input, select {
+      width: 100%;
+      padding: 0.5rem 0.6rem;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: #0d1117;
+      color: var(--text);
+      margin-bottom: 0.65rem;
+      font-size: 0.95rem;
+    }
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      padding: 0.55rem 1rem;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 0.9rem;
+      cursor: pointer;
+    }
+    button:hover { filter: brightness(1.08); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .row { display: grid; gap: 0.65rem; }
+    @media (min-width: 560px) {
+      .row-2 { grid-template-columns: 1fr 1fr; }
+    }
+    pre {
+      margin: 0.75rem 0 0;
+      padding: 0.75rem;
+      background: #0d1117;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      font-size: 0.78rem;
+      overflow: auto;
+      max-height: 22rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .status { font-size: 0.8rem; margin-top: 0.5rem; }
+    .status.ok { color: var(--ok); }
+    .status.bad { color: var(--err); }
+    footer { margin-top: 2rem; font-size: 0.8rem; color: var(--muted); }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>wsprobe</h1>
+    <p class="lead">
+      Read-only checks against Wealthsimple on <strong>this computer</strong>.
+      Log in at <a href="https://my.wealthsimple.com" target="_blank" rel="noopener">my.wealthsimple.com</a>,
+      quit the browser, then use the buttons below.
+    </p>
+    <div class="warn">
+      This page talks to a small server on your machine only (<code>127.0.0.1</code>).
+      It does not submit or finalize trades. Place real orders in the official Wealthsimple app.
+    </div>
+
+    <section>
+      <h2>Session</h2>
+      <label for="browser">Browser cookie source (optional)</label>
+      <select id="browser">
+        <option value="">Auto-detect (recommended)</option>
+        <option value="chrome">Chrome</option>
+        <option value="edge">Edge</option>
+        <option value="firefox">Firefox</option>
+        <option value="brave">Brave</option>
+        <option value="opera">Opera</option>
+        <option value="safari">Safari</option>
+      </select>
+    </section>
+
+    <section>
+      <h2>Connection check</h2>
+      <p style="margin:0 0 0.75rem;font-size:0.85rem;color:var(--muted);">Verifies your session can call Wealthsimple GraphQL.</p>
+      <button type="button" id="btn-ping">Run check</button>
+      <div class="status" id="st-ping" aria-live="polite"></div>
+      <pre id="out-ping" hidden></pre>
+    </section>
+
+    <section>
+      <h2>Security</h2>
+      <label for="sec-id">Security id (e.g. sec-s-… from the app URL)</label>
+      <input id="sec-id" type="text" placeholder="sec-s-…" autocomplete="off" />
+      <button type="button" id="btn-security">Fetch security</button>
+      <div class="status" id="st-security" aria-live="polite"></div>
+      <pre id="out-security" hidden></pre>
+    </section>
+
+    <section>
+      <h2>Limit restrictions</h2>
+      <div class="row row-2">
+        <div>
+          <label for="rest-sec">Security id</label>
+          <input id="rest-sec" type="text" placeholder="sec-s-…" autocomplete="off" />
+        </div>
+        <div>
+          <label for="rest-side">Side</label>
+          <select id="rest-side">
+            <option value="BUY">BUY</option>
+            <option value="SELL">SELL</option>
+          </select>
+        </div>
+      </div>
+      <button type="button" id="btn-rest">Fetch restrictions</button>
+      <div class="status" id="st-rest" aria-live="polite"></div>
+      <pre id="out-rest" hidden></pre>
+    </section>
+
+    <section>
+      <h2>Preview buy (no order placed)</h2>
+      <div class="row row-2">
+        <div>
+          <label for="pb-sec">Security id</label>
+          <input id="pb-sec" type="text" placeholder="sec-s-…" autocomplete="off" />
+        </div>
+        <div>
+          <label for="pb-shares">Shares</label>
+          <input id="pb-shares" type="number" step="any" min="0" placeholder="1" />
+        </div>
+      </div>
+      <div class="row row-2">
+        <div>
+          <label for="pb-order">Order type</label>
+          <select id="pb-order">
+            <option value="market">Market</option>
+            <option value="limit">Limit</option>
+          </select>
+        </div>
+        <div>
+          <label for="pb-limit">Limit price (USD, limit only)</label>
+          <input id="pb-limit" type="number" step="any" placeholder="optional" />
+        </div>
+      </div>
+      <label for="pb-assume">Assume price per share (optional, for rough notional)</label>
+      <input id="pb-assume" type="number" step="any" placeholder="optional" />
+      <button type="button" id="btn-preview">Preview</button>
+      <div class="status" id="st-preview" aria-live="polite"></div>
+      <pre id="out-preview" hidden></pre>
+    </section>
+
+    <section style="border-color: var(--err);">
+      <h2>Real market buy (Wealthsimple Trade)</h2>
+      <p style="margin:0 0 0.75rem;font-size:0.85rem;color:var(--muted);">
+        Uses the <strong>same login</strong> as the session section (OAuth token) and Wealthsimple’s
+        <code>trade-service.wealthsimple.com</code> REST API — not SnapTrade. Market buys include a reference
+        <code>limit_price</code> from the live quote (same pattern as the official app stack).
+      </p>
+      <button type="button" id="btn-taccounts" style="background:#21262d;margin-bottom:0.75rem;">List Trade account ids</button>
+      <label for="buy-ticker">Ticker symbol <strong>or</strong> security id</label>
+      <input id="buy-ticker" type="text" placeholder="e.g. VFV.TO  or  sec-s-…" autocomplete="off" />
+      <label for="buy-acct">Account id (only if you have more than one account)</label>
+      <input id="buy-acct" type="text" placeholder="leave blank if you only have one Trade account" autocomplete="off" />
+      <label for="buy-units">Shares</label>
+      <input id="buy-units" type="number" step="any" min="0" value="1" />
+      <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;">
+        <input type="checkbox" id="buy-confirm" />
+        <span>I understand this submits a real market order with real money.</span>
+      </label>
+      <button type="button" id="btn-buy" style="margin-top:0.75rem;background:var(--err);">Submit market buy</button>
+      <div class="status" id="st-buy" aria-live="polite"></div>
+      <pre id="out-buy" hidden></pre>
+    </section>
+
+    <footer>
+      CLI: <code>wsprobe buy --symbol VFV.TO --shares 1 --confirm</code> (one account) · <code>wsprobe-serve</code> + this page
+      · Web: <code>wsprobe-serve</code> after <code>pip install -e '.[web]'</code>
+    </footer>
+  </div>
+  <script>
+    function sessionBody() {
+      const b = document.getElementById("browser").value;
+      const o = {};
+      if (b) o.browser = b;
+      return o;
+    }
+    async function post(path, body) {
+      const r = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...sessionBody(), ...body }),
+      });
+      const text = await r.text();
+      let data;
+      try { data = JSON.parse(text); } catch (_) { data = { raw: text }; }
+      if (!r.ok) {
+        const err = new Error(data.detail ? JSON.stringify(data.detail) : text);
+        err.payload = data;
+        throw err;
+      }
+      return data;
+    }
+    function show(preId, stId, ok, msg, obj) {
+      const pre = document.getElementById(preId);
+      const st = document.getElementById(stId);
+      pre.hidden = false;
+      pre.textContent = typeof obj === "string" ? obj : JSON.stringify(obj, null, 2);
+      st.textContent = msg;
+      st.className = "status " + (ok ? "ok" : "bad");
+    }
+    document.getElementById("btn-ping").onclick = async () => {
+      const b = document.getElementById("btn-ping");
+      b.disabled = true;
+      try {
+        const data = await post("/api/ping", {});
+        show("out-ping", "st-ping", true, "OK — session: " + data.credential_source, data);
+      } catch (e) {
+        show("out-ping", "st-ping", false, e.message, e.payload || e.message);
+      }
+      b.disabled = false;
+    };
+    document.getElementById("btn-security").onclick = async () => {
+      const id = document.getElementById("sec-id").value.trim();
+      if (!id) { alert("Enter a security id"); return; }
+      const b = document.getElementById("btn-security");
+      b.disabled = true;
+      try {
+        const data = await post("/api/security", { security_id: id });
+        show("out-security", "st-security", true, "OK — " + data.credential_source, data);
+      } catch (e) {
+        show("out-security", "st-security", false, e.message, e.payload || e.message);
+      }
+      b.disabled = false;
+    };
+    document.getElementById("btn-rest").onclick = async () => {
+      const id = document.getElementById("rest-sec").value.trim();
+      if (!id) { alert("Enter a security id"); return; }
+      const b = document.getElementById("btn-rest");
+      b.disabled = true;
+      try {
+        const data = await post("/api/restrictions", {
+          security_id: id,
+          side: document.getElementById("rest-side").value,
+        });
+        show("out-rest", "st-rest", true, "OK — " + data.credential_source, data);
+      } catch (e) {
+        show("out-rest", "st-rest", false, e.message, e.payload || e.message);
+      }
+      b.disabled = false;
+    };
+    document.getElementById("btn-preview").onclick = async () => {
+      const security_id = document.getElementById("pb-sec").value.trim();
+      const shares = parseFloat(document.getElementById("pb-shares").value);
+      const order = document.getElementById("pb-order").value;
+      const limitRaw = document.getElementById("pb-limit").value;
+      const assumeRaw = document.getElementById("pb-assume").value;
+      if (!security_id) { alert("Enter a security id"); return; }
+      if (!(shares > 0)) { alert("Enter a positive share count"); return; }
+      const body = { security_id, shares, order };
+      if (order === "limit" && limitRaw) body.limit_price = parseFloat(limitRaw);
+      if (assumeRaw) body.assume_price = parseFloat(assumeRaw);
+      const b = document.getElementById("btn-preview");
+      b.disabled = true;
+      try {
+        const data = await post("/api/preview-buy", body);
+        show("out-preview", "st-preview", true, "Preview only — " + data.credential_source, data);
+      } catch (e) {
+        show("out-preview", "st-preview", false, e.message, e.payload || e.message);
+      }
+      b.disabled = false;
+    };
+    document.getElementById("btn-taccounts").onclick = async () => {
+      const b = document.getElementById("btn-taccounts");
+      b.disabled = true;
+      try {
+        const data = await post("/api/trade-accounts", {});
+        show("out-buy", "st-buy", true, "Trade accounts — copy an id into Account id", data);
+      } catch (e) {
+        show("out-buy", "st-buy", false, e.message, e.payload || e.message);
+      }
+      b.disabled = false;
+    };
+    document.getElementById("btn-buy").onclick = async () => {
+      if (!document.getElementById("buy-confirm").checked) {
+        alert("Check the confirmation box first.");
+        return;
+      }
+      const raw = document.getElementById("buy-ticker").value.trim();
+      const acct = document.getElementById("buy-acct").value.trim();
+      const shares = parseFloat(document.getElementById("buy-units").value);
+      if (!raw) { alert("Enter a ticker (e.g. VFV.TO) or sec-s-… id"); return; }
+      if (!(shares > 0)) { alert("Enter a positive share count"); return; }
+      const body = { shares, confirm: true };
+      if (acct) body.account_id = acct;
+      if (raw.toLowerCase().startsWith("sec-s-")) body.security_id = raw;
+      else body.symbol = raw;
+      const b = document.getElementById("btn-buy");
+      b.disabled = true;
+      try {
+        const data = await post("/api/buy", body);
+        show("out-buy", "st-buy", true, "Order submitted (Wealthsimple Trade)", data);
+      } catch (e) {
+        show("out-buy", "st-buy", false, e.message, e.payload || e.message);
+      }
+      b.disabled = false;
+    };
+  </script>
+</body>
+</html>
