@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import shutil
+import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 from wsprobe import __version__
-from wsprobe.client import format_json, graphql_request, identity_id_from_token
+from wsprobe.client import (
+    format_json,
+    graphql_request,
+    identity_id_for_graphql,
+)
 from wsprobe.credentials import (
     CONFIG_FILE,
+    SESSION_FILE,
+    _persist_bundle,
     ensure_fresh_access_token,
     load_oauth_bundle,
     resolve_access_token,
@@ -34,8 +45,13 @@ def _print_result(payload: dict[str, Any], *, as_json: bool) -> None:
         print(format_json(data))
 
 
-def run_ping_with_token(token: str, args: argparse.Namespace) -> int:
-    sub = identity_id_from_token(token)
+def run_ping_with_token(
+    token: str,
+    args: argparse.Namespace,
+    *,
+    oauth_bundle: dict[str, Any] | None = None,
+) -> int:
+    sub = identity_id_for_graphql(token, oauth_bundle)
     if not sub:
         raise SystemExit("Could not read identity id from token")
 
@@ -44,6 +60,7 @@ def run_ping_with_token(token: str, args: argparse.Namespace) -> int:
         operation_name="FetchIdentityPackages",
         query=FETCH_IDENTITY_PACKAGES,
         variables={"id": sub},
+        oauth_bundle=oauth_bundle,
     )
     if raw:
         print(raw, file=sys.stderr)
@@ -64,21 +81,27 @@ def _graphql_query_with_auth_retry(
     query: str,
     variables: dict[str, Any],
 ) -> tuple[int, dict[str, Any] | None, str | None]:
+    bundle, persist, _src = load_oauth_bundle(args)
     injected_token = getattr(args, "access_token", None)
-    token = str(injected_token) if injected_token else resolve_access_token(args)
+    if injected_token:
+        token = str(injected_token)
+    else:
+        token = ensure_fresh_access_token(bundle, persist_path=persist)
     status, payload, raw = graphql_request(
         access_token=token,
         operation_name=operation_name,
         query=query,
         variables=variables,
+        oauth_bundle=bundle,
     )
     if status == 401:
-        refreshed = resolve_access_token_force_refresh(args)
+        refreshed = ensure_fresh_access_token(bundle, persist_path=persist, force_refresh=True)
         status, payload, raw = graphql_request(
             access_token=refreshed,
             operation_name=operation_name,
             query=query,
             variables=variables,
+            oauth_bundle=bundle,
         )
     return status, payload, raw
 
@@ -89,11 +112,13 @@ def cmd_easy(args: argparse.Namespace) -> int:
     if not args.json and src.startswith("browser:"):
         print(f"Using cookies from: {src.split(':', 1)[1]}", file=sys.stderr)
     token = ensure_fresh_access_token(bundle, persist_path=persist)
-    return run_ping_with_token(token, args)
+    return run_ping_with_token(token, args, oauth_bundle=bundle)
 
 
 def cmd_ping(args: argparse.Namespace) -> int:
-    return run_ping_with_token(resolve_access_token(args), args)
+    bundle, persist, _ = load_oauth_bundle(args)
+    token = ensure_fresh_access_token(bundle, persist_path=persist)
+    return run_ping_with_token(token, args, oauth_bundle=bundle)
 
 
 def cmd_security(args: argparse.Namespace) -> int:
@@ -151,6 +176,29 @@ def cmd_restrictions(args: argparse.Namespace) -> int:
 
 def cmd_config_path(_: argparse.Namespace) -> int:
     print(str(CONFIG_FILE))
+    return 0
+
+
+def cmd_session_path(_: argparse.Namespace) -> int:
+    """Where OAuth tokens are saved when not using env / --token-file."""
+    print(str(SESSION_FILE))
+    return 0
+
+
+def cmd_import_session(args: argparse.Namespace) -> int:
+    """Write pasted JSON (access_token + optional refresh_token) to session.json."""
+    path_arg = getattr(args, "import_session_file", None)
+    if path_arg:
+        raw = Path(path_arg).expanduser().read_text(encoding="utf-8")
+    else:
+        raw = sys.stdin.read()
+    if not raw.strip():
+        raise SystemExit("No JSON input (give a file path or pipe JSON on stdin)")
+    data = json.loads(raw)
+    if not isinstance(data, dict) or not data.get("access_token"):
+        raise SystemExit("JSON must be an object with at least access_token")
+    _persist_bundle(SESSION_FILE, data)
+    print(f"Saved credentials to {SESSION_FILE}", file=sys.stderr)
     return 0
 
 
@@ -344,6 +392,45 @@ def cmd_snaptrade_buy(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_session_snippet(args: argparse.Namespace) -> int:
+    """Print JS for pasting into DevTools on my.wealthsimple.com to build session.json."""
+    print(
+        "Copy only the JavaScript below into the browser console (not this shell command).\n",
+        file=sys.stderr,
+    )
+    base = Path(__file__).resolve().parent
+    if getattr(args, "export_session_full", False):
+        path = base / "export_session_console.js"
+    else:
+        minp = base / "export_session_console.min.js"
+        path = minp if minp.is_file() else base / "export_session_console.js"
+    sys.stdout.write(path.read_text(encoding="utf-8"))
+    return 0
+
+
+def cmd_bird(args: argparse.Namespace) -> int:
+    """
+    Run @steipete/bird (X/Twitter cookie + GraphQL) via npx. Separate from Wealthsimple auth.
+    """
+    npx = shutil.which("npx")
+    if not npx:
+        raise SystemExit(
+            "bird: need Node.js npx on PATH (install Node, then retry).\n"
+            "This subcommand does not use Wealthsimple cookies."
+        )
+    pkg = os.environ.get("WSPROBE_BIRD_PACKAGE", "@steipete/bird").strip() or "@steipete/bird"
+    rest = list(args.bird_argv)
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+    if not rest:
+        rest = ["check"]
+    cmd = [npx, "-y", pkg, *rest]
+    try:
+        return subprocess.call(cmd)
+    except OSError as e:
+        raise SystemExit(f"bird: failed to run {cmd[0]}: {e}") from e
+
+
 def cmd_trade_accounts(args: argparse.Namespace) -> int:
     """List Trade account ids (GET /account/list)."""
     try:
@@ -396,6 +483,12 @@ def build_parser() -> argparse.ArgumentParser:
             "  %(prog)s trade-accounts            list account ids (Trade REST)\n"
             "  %(prog)s buy --symbol VFV.TO --shares 1 --confirm   market buy (easiest; one account)\n"
             "  %(prog)s snaptrade-buy HOD.TO 1 --confirm   buy via SnapTrade (optional)\n"
+            "  %(prog)s bird check                 X/Twitter session via @steipete/bird (npx; not Wealthsimple)\n"
+            "  %(prog)s export-session-snippet     print JS: paste on my.wealthsimple.com → session.json\n"
+            "  %(prog)s session-path               print where session.json lives (~/.config/wsprobe/)\n"
+            "  %(prog)s import-session tokens.json   save tokens to session.json (or stdin)\n"
+            "  %(prog)s --access-token \"$JWT\" ping   use this JWT instead of browser/session file\n"
+            "  export WEALTHSIMPLE_OAUTH_JSON='{\"access_token\":\"…\",\"refresh_token\":\"…\"}'   env bundle\n"
         ),
     )
     p.add_argument(
@@ -416,6 +509,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--token-file",
         metavar="PATH",
         help='JSON file with access_token (optional refresh_token for auto-refresh)',
+    )
+    p.add_argument(
+        "--access-token",
+        dest="access_token",
+        metavar="JWT",
+        help=(
+            "Use this bearer JWT for this run (skips browser/session file). "
+            "Optional refresh: --refresh-token or WEALTHSIMPLE_REFRESH_TOKEN. "
+            "Or set WEALTHSIMPLE_OAUTH_JSON to a JSON object with access_token and optional refresh_token. "
+            "Avoid passing secrets on the command line (shell history); prefer env or import-session."
+        ),
+    )
+    p.add_argument(
+        "--refresh-token",
+        dest="refresh_token",
+        metavar="TOKEN",
+        default=None,
+        help="Use with --access-token (overrides WEALTHSIMPLE_REFRESH_TOKEN for this run).",
     )
     p.add_argument(
         "--json",
@@ -503,6 +614,30 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_config_path)
 
     sp = sub.add_parser(
+        "session-path",
+        help="Print path to session.json (saved OAuth tokens from browser or manual paste)",
+    )
+    sp.set_defaults(func=cmd_session_path)
+
+    sp = sub.add_parser(
+        "import-session",
+        help="Save JSON credentials to session.json (from file or stdin)",
+        description=(
+            "Reads JSON with access_token (and optional refresh_token, client_id) and merges into "
+            + str(SESSION_FILE)
+            + ". Example:  wsprobe import-session ~/tokens.json   or   pbpaste | wsprobe import-session"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sp.add_argument(
+        "import_session_file",
+        nargs="?",
+        metavar="FILE",
+        help="JSON file; omit to read JSON from stdin",
+    )
+    sp.set_defaults(func=cmd_import_session)
+
+    sp = sub.add_parser(
         "trade-accounts",
         help="List Wealthsimple Trade account ids (uses OAuth token from cookies/env)",
     )
@@ -567,6 +702,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="SnapTrade account id (default: SNAPTRADE_ACCOUNT_ID or first linked account)",
     )
     sp.set_defaults(func=cmd_snaptrade_buy)
+
+    sp = sub.add_parser(
+        "bird",
+        help="Run @steipete/bird (X cookie GraphQL) via npx — separate from Wealthsimple OAuth",
+        description=(
+            "Delegates to the npm package @steipete/bird (requires Node.js npx). "
+            "Uses X/Twitter auth_token + ct0 cookies, not Wealthsimple. "
+            "Default subcommand when omitted: check. "
+            "Override package with env WSPROBE_BIRD_PACKAGE (default: @steipete/bird)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sp.add_argument(
+        "bird_argv",
+        nargs="*",
+        metavar="ARG",
+        help="Passed to bird (e.g. check, whoami, read <url>). Use -- before flags if needed.",
+    )
+    sp.set_defaults(func=cmd_bird)
+
+    sp = sub.add_parser(
+        "export-session-snippet",
+        help="Print console script: paste on my.wealthsimple.com to emit ~/.config/wsprobe/session.json",
+    )
+    sp.add_argument(
+        "--full",
+        action="store_true",
+        dest="export_session_full",
+        help="Print readable multi-line source (default is one-line minified)",
+    )
+    sp.set_defaults(func=cmd_export_session_snippet)
 
     return p
 

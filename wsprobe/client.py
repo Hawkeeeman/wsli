@@ -28,9 +28,32 @@ def identity_id_from_token(token: str) -> str | None:
         raw = __import__("base64").urlsafe_b64decode(payload_b64 + pad)
         data = json.loads(raw.decode("utf-8"))
         sub = data.get("sub")
-        return str(sub) if sub else None
+        if sub:
+            return str(sub)
+        for key in ("identity_canonical_id", "identity_id"):
+            v = data.get(key)
+            if v:
+                return str(v)
+        return None
     except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
         return None
+
+
+def identity_id_for_graphql(
+    access_token: str, oauth_bundle: dict[str, Any] | None = None
+) -> str | None:
+    iid = identity_id_from_token(access_token)
+    if iid:
+        return iid
+    if not oauth_bundle:
+        return None
+    for key in ("identity_canonical_id", "identity_id"):
+        v = oauth_bundle.get(key)
+        if v:
+            s = str(v).strip()
+            if s:
+                return s
+    return None
 
 
 def graphql_request(
@@ -40,11 +63,12 @@ def graphql_request(
     query: str,
     variables: dict[str, Any] | None = None,
     profile: str = "trade",
+    oauth_bundle: dict[str, Any] | None = None,
     timeout_s: float = 30.0,
 ) -> tuple[int, dict[str, Any] | None, str | None]:
     _assert_query_only(query)
 
-    identity_id = identity_id_from_token(access_token)
+    identity_id = identity_id_for_graphql(access_token, oauth_bundle)
     headers = {
         "accept": "*/*",
         "content-type": "application/json",

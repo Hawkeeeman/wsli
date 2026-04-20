@@ -131,9 +131,15 @@ def load_oauth_bundle(args: Namespace) -> tuple[dict[str, Any], Path | None, str
     injected = getattr(args, "access_token", None)
     if injected:
         d: dict[str, Any] = {"access_token": str(injected)}
-        r = os.environ.get("WEALTHSIMPLE_REFRESH_TOKEN", "").strip()
-        if r:
-            d["refresh_token"] = r
+        cli_refresh = getattr(args, "refresh_token", None)
+        if cli_refresh:
+            cr = str(cli_refresh).strip()
+            if cr:
+                d["refresh_token"] = cr
+        else:
+            r = os.environ.get("WEALTHSIMPLE_REFRESH_TOKEN", "").strip()
+            if r:
+                d["refresh_token"] = r
         cid = os.environ.get("WEALTHSIMPLE_OAUTH_CLIENT_ID", "").strip()
         if cid:
             d["client_id"] = cid
@@ -154,6 +160,16 @@ def load_oauth_bundle(args: Namespace) -> tuple[dict[str, Any], Path | None, str
         if not isinstance(data, dict) or not data.get("access_token"):
             raise SystemExit(f"No access_token in {p}")
         return data, p, f"file:{p}"
+
+    oauth_json = os.environ.get("WEALTHSIMPLE_OAUTH_JSON", "").strip()
+    if oauth_json:
+        try:
+            data = json.loads(oauth_json)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"WEALTHSIMPLE_OAUTH_JSON must be valid JSON: {e}") from e
+        if not isinstance(data, dict) or not data.get("access_token"):
+            raise SystemExit("WEALTHSIMPLE_OAUTH_JSON must be a JSON object with access_token")
+        return data, None, "env:oauth_json"
 
     env = os.environ.get("WEALTHSIMPLE_ACCESS_TOKEN", "").strip()
     if env:
@@ -188,7 +204,9 @@ def load_oauth_bundle(args: Namespace) -> tuple[dict[str, Any], Path | None, str
         "  wsprobe\n"
         "or:\n"
         "  wsprobe --cookies-from-browser chrome ping\n"
-        "Or set WEALTHSIMPLE_ACCESS_TOKEN / WEALTHSIMPLE_REFRESH_TOKEN / --token-file / "
+        "Or: paste JSON into  wsprobe import-session  (see  wsprobe session-path  for file location)\n"
+        "Or set WEALTHSIMPLE_OAUTH_JSON (JSON with access_token + optional refresh_token), "
+        "or WEALTHSIMPLE_ACCESS_TOKEN / WEALTHSIMPLE_REFRESH_TOKEN / --token-file / "
         f"{CONFIG_FILE}"
     )
 

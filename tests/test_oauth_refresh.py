@@ -162,6 +162,61 @@ class TestEnsureFresh(unittest.TestCase):
 
 
 class TestCredentialSourceOrder(unittest.TestCase):
+    def test_oauth_json_env_skips_session(self) -> None:
+        session_path = Path(__file__).resolve().parent / "_tmp_session_oauthjson.json"
+        session_path.write_text(
+            json.dumps({"access_token": "wrong", "refresh_token": "x"}),
+            encoding="utf-8",
+        )
+        old_session = credentials.SESSION_FILE
+        credentials.SESSION_FILE = session_path
+        old_oauth = os.environ.pop("WEALTHSIMPLE_OAUTH_JSON", None)
+        try:
+            os.environ["WEALTHSIMPLE_OAUTH_JSON"] = json.dumps(
+                {"access_token": "from-env-json", "refresh_token": "rt-env"}
+            )
+            ns = type(
+                "Ns",
+                (),
+                {
+                    "access_token": None,
+                    "refresh_token": None,
+                    "cookies_browser": None,
+                    "token_file": None,
+                    "command": "ping",
+                },
+            )()
+            bundle, persist, src = load_oauth_bundle(ns)
+            self.assertEqual(bundle["access_token"], "from-env-json")
+            self.assertEqual(bundle["refresh_token"], "rt-env")
+            self.assertIsNone(persist)
+            self.assertEqual(src, "env:oauth_json")
+        finally:
+            credentials.SESSION_FILE = old_session
+            if old_oauth is not None:
+                os.environ["WEALTHSIMPLE_OAUTH_JSON"] = old_oauth
+            else:
+                os.environ.pop("WEALTHSIMPLE_OAUTH_JSON", None)
+            if session_path.is_file():
+                session_path.unlink()
+
+    def test_cli_refresh_pairs_with_access_token(self) -> None:
+        ns = type(
+            "Ns",
+            (),
+            {
+                "access_token": "acc",
+                "refresh_token": "cli-rt",
+                "cookies_browser": None,
+                "token_file": None,
+                "command": "ping",
+            },
+        )()
+        bundle, persist, src = load_oauth_bundle(ns)
+        self.assertEqual(bundle["access_token"], "acc")
+        self.assertEqual(bundle["refresh_token"], "cli-rt")
+        self.assertEqual(src, "injected")
+
     def test_session_file_used_when_config_missing(self) -> None:
         session_path = Path(__file__).resolve().parent / "_tmp_session.json"
         data = {"access_token": "session-token", "refresh_token": "session-refresh"}
