@@ -131,23 +131,10 @@ class PreviewBuyBody(SessionBody):
     assume_price: Optional[float] = None
 
 
-class WealthsimpleBuyBody(SessionBody):
-    """Market buy via Wealthsimple Trade REST (same OAuth token as other endpoints)."""
-
-    shares: float
-    confirm: bool = False
-    account_id: Optional[str] = None
-    symbol: Optional[str] = None
-    security_id: Optional[str] = None
-
-
 app = FastAPI(
     title="wsprobe",
     version=__version__,
-    description=(
-        "Wealthsimple read-only GraphQL checks on your machine; POST /api/buy uses Trade REST (real orders). "
-        "Bind is loopback-only by default."
-    ),
+    description="Wealthsimple read-only GraphQL checks on your machine. Bind is loopback-only by default.",
 )
 
 
@@ -280,65 +267,6 @@ def api_preview_buy(body: PreviewBuyBody) -> dict[str, Any]:
     return payload
 
 
-@app.post("/api/buy")
-def api_wealthsimple_buy(body: WealthsimpleBuyBody) -> dict[str, Any]:
-    if not body.confirm:
-        raise HTTPException(
-            status_code=400,
-            detail="Refusing: set confirm=true to submit a real market buy (Wealthsimple Trade REST).",
-        )
-    if body.shares <= 0:
-        raise HTTPException(status_code=400, detail="shares must be positive")
-    sym = (body.symbol or "").strip()
-    sec = (body.security_id or "").strip()
-    if sym and sec:
-        raise HTTPException(status_code=400, detail="Provide only one of: symbol, security_id")
-    if not sym and not sec:
-        raise HTTPException(status_code=400, detail="Provide symbol (e.g. VFV.TO) or security_id (sec-s-…)")
-    token, src = resolve_session_token(
-        browser=body.browser,
-        token_file=body.token_file,
-        oauth_cookie_value=body.oauth_cookie_value,
-    )
-    try:
-        from wsprobe.trade_service import pick_account_id, place_market_buy as ws_buy, symbol_to_security_id
-
-        account_id = pick_account_id(token, body.account_id)
-        security_id = symbol_to_security_id(token, sym) if sym else sec
-        order_payload = ws_buy(
-            token,
-            account_id=account_id,
-            security_id=security_id,
-            quantity=float(body.shares),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
-    return {
-        "ok": True,
-        "credential_source": src,
-        "account_id": account_id,
-        "security_id": security_id,
-        "shares": body.shares,
-        "order": order_payload,
-    }
-
-
-@app.post("/api/trade-accounts")
-def api_trade_accounts(body: PingBody) -> dict[str, Any]:
-    token, src = resolve_session_token(
-        browser=body.browser,
-        token_file=body.token_file,
-        oauth_cookie_value=body.oauth_cookie_value,
-    )
-    try:
-        from wsprobe.trade_service import list_accounts
-
-        rows = list_accounts(token)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
-    return {"credential_source": src, "accounts": rows}
-
-
 @app.get("/")
 def index() -> FileResponse:
     index_path = STATIC_DIR / "index.html"
@@ -364,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     import uvicorn
 
     print(f"wsprobe {__version__} — open http://{args.host}:{args.port}/ in your browser", file=sys.stderr)
-    print("Quit with Ctrl+C. Preview GraphQL is read-only; real buys: POST /api/buy (Trade REST).", file=sys.stderr)
+    print("Quit with Ctrl+C. This UI is read-only (GraphQL queries only).", file=sys.stderr)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 

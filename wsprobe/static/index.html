@@ -189,32 +189,8 @@
       <pre id="out-preview" hidden></pre>
     </section>
 
-    <section style="border-color: var(--err);">
-      <h2>Real market buy (Wealthsimple Trade)</h2>
-      <p style="margin:0 0 0.75rem;font-size:0.85rem;color:var(--muted);">
-        Uses the <strong>same login</strong> as the session section (OAuth token) and Wealthsimple’s
-        <code>trade-service.wealthsimple.com</code> REST API — not SnapTrade. Market buys include a reference
-        <code>limit_price</code> from the live quote (same pattern as the official app stack).
-      </p>
-      <button type="button" id="btn-taccounts" style="background:#21262d;margin-bottom:0.75rem;">List Trade account ids</button>
-      <label for="buy-ticker">Ticker symbol <strong>or</strong> security id</label>
-      <input id="buy-ticker" type="text" placeholder="e.g. VFV.TO  or  sec-s-…" autocomplete="off" />
-      <label for="buy-acct">Account id (only if you have more than one account)</label>
-      <input id="buy-acct" type="text" placeholder="leave blank if you only have one Trade account" autocomplete="off" />
-      <label for="buy-units">Shares</label>
-      <input id="buy-units" type="number" step="any" min="0" value="1" />
-      <label style="display:flex;align-items:center;gap:0.5rem;margin-top:0.5rem;cursor:pointer;">
-        <input type="checkbox" id="buy-confirm" />
-        <span>I understand this submits a real market order with real money.</span>
-      </label>
-      <button type="button" id="btn-buy" style="margin-top:0.75rem;background:var(--err);">Submit market buy</button>
-      <div class="status" id="st-buy" aria-live="polite"></div>
-      <pre id="out-buy" hidden></pre>
-    </section>
-
     <footer>
-      CLI: <code>wsprobe buy --symbol VFV.TO --shares 1 --confirm</code> (one account) · <code>wsprobe-serve</code> + this page
-      · Web: <code>wsprobe-serve</code> after <code>pip install -e '.[web]'</code>
+      <code>wsprobe-serve</code> (after <code>pip install -e '.[web]'</code>) · this page
     </footer>
   </div>
   <script>
@@ -328,47 +304,6 @@
         show("out-preview", "st-preview", true, "Preview only — " + data.credential_source, data);
       } catch (e) {
         show("out-preview", "st-preview", false, e.message, e.payload || e.message);
-      }
-      b.disabled = false;
-      b.textContent = oldLabel;
-    };
-    document.getElementById("btn-taccounts").onclick = async () => {
-      const b = document.getElementById("btn-taccounts");
-      const oldLabel = b.textContent;
-      b.disabled = true;
-      b.textContent = "Loading...";
-      try {
-        const data = await post("/api/trade-accounts", {});
-        show("out-buy", "st-buy", true, "Trade accounts — copy an id into Account id", data);
-      } catch (e) {
-        show("out-buy", "st-buy", false, e.message, e.payload || e.message);
-      }
-      b.disabled = false;
-      b.textContent = oldLabel;
-    };
-    document.getElementById("btn-buy").onclick = async () => {
-      if (!document.getElementById("buy-confirm").checked) {
-        showInputError("out-buy", "st-buy", "Check the confirmation box first.");
-        return;
-      }
-      const raw = document.getElementById("buy-ticker").value.trim();
-      const acct = document.getElementById("buy-acct").value.trim();
-      const shares = parseFloat(document.getElementById("buy-units").value);
-      if (!raw) { showInputError("out-buy", "st-buy", "Enter a ticker (e.g. VFV.TO) or sec-s-… id"); return; }
-      if (!(shares > 0)) { showInputError("out-buy", "st-buy", "Enter a positive share count"); return; }
-      const body = { shares, confirm: true };
-      if (acct) body.account_id = acct;
-      if (raw.toLowerCase().startsWith("sec-s-")) body.security_id = raw;
-      else body.symbol = raw;
-      const b = document.getElementById("btn-buy");
-      const oldLabel = b.textContent;
-      b.disabled = true;
-      b.textContent = "Submitting...";
-      try {
-        const data = await post("/api/buy", body);
-        show("out-buy", "st-buy", true, "Order submitted (Wealthsimple Trade)", data);
-      } catch (e) {
-        show("out-buy", "st-buy", false, e.message, e.payload || e.message);
       }
       b.disabled = false;
       b.textContent = oldLabel;

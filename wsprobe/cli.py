@@ -19,7 +19,6 @@ from wsprobe.credentials import (
     ensure_fresh_access_token,
     load_oauth_bundle,
     resolve_access_token,
-    resolve_access_token_force_refresh,
 )
 from wsprobe.queries import (
     FETCH_IDENTITY_PACKAGES,
@@ -350,54 +349,7 @@ def cmd_preview_buy(args: argparse.Namespace) -> int:
     print()
     print("Preview complete: checks ran successfully.", file=sys.stderr)
     print("No order was submitted.", file=sys.stderr)
-    print("To place a real order: wsprobe buy --symbol <TICKER> --shares <N> --confirm", file=sys.stderr)
-    return 0
-
-
-def cmd_buy(args: argparse.Namespace) -> int:
-    """Real market buy via Wealthsimple Trade REST (trade-service), using the same OAuth token as GraphQL."""
-    if not getattr(args, "confirm", False):
-        print(
-            "This places a REAL market BUY on Wealthsimple Trade (trade-service.wealthsimple.com).\n"
-            "Uses the same session as wsprobe GraphQL (browser cookies / WEALTHSIMPLE_ACCESS_TOKEN + optional refresh).\n"
-            "Easiest: wsprobe buy --symbol VFV.TO --shares 1 --confirm   (one account only; else add --account-id)\n"
-            "Or: wsprobe buy --security-id sec-s-… --shares 1 --confirm\n",
-            file=sys.stderr,
-        )
-        return 1
-    try:
-        from wsprobe.trade_service import pick_account_id, place_market_buy as ws_place, symbol_to_security_id
-
-        def _submit_with_token(token: str) -> dict[str, Any]:
-            account_id = pick_account_id(token, getattr(args, "account_id", None))
-            sym_arg = getattr(args, "symbol", None)
-            if sym_arg and str(sym_arg).strip():
-                security_id = symbol_to_security_id(token, str(sym_arg).strip())
-            else:
-                security_id = str(args.security_id).strip()
-            return ws_place(
-                token,
-                account_id=account_id,
-                security_id=security_id,
-                quantity=float(args.shares),
-            )
-
-        token = resolve_access_token(args)
-        try:
-            out = _submit_with_token(token)
-        except RuntimeError as e:
-            if "HTTP 401" not in str(e):
-                raise
-            refreshed = resolve_access_token_force_refresh(args)
-            out = _submit_with_token(refreshed)
-    except Exception as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if args.json:
-        print(format_json({"ok": True, "order": out}))
-    else:
-        print("Order submitted (Wealthsimple Trade). Response:", file=sys.stderr)
-        print(format_json(out))
+    print("Place a real order in the official Wealthsimple app.", file=sys.stderr)
     return 0
 
 
@@ -417,41 +369,11 @@ def cmd_export_session_snippet(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_trade_accounts(args: argparse.Namespace) -> int:
-    """List Trade account ids (GET /account/list)."""
-    try:
-        from wsprobe.trade_service import list_accounts
-
-        token = resolve_access_token(args)
-        try:
-            rows = list_accounts(token)
-        except RuntimeError as e:
-            if "HTTP 401" not in str(e):
-                raise
-            refreshed = resolve_access_token_force_refresh(args)
-            rows = list_accounts(refreshed)
-    except Exception as e:
-        print(str(e), file=sys.stderr)
-        return 1
-    if args.json:
-        print(format_json({"accounts": rows}))
-        return 0
-    for a in rows:
-        if not isinstance(a, dict):
-            continue
-        aid = a.get("id", "")
-        atype = a.get("account_type", "")
-        cur = (a.get("base_currency") or "") if isinstance(a.get("base_currency"), str) else ""
-        print(f"{aid}\t{atype}\t{cur}".strip())
-    return 0
-
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="wsprobe",
         description=(
-            "Wealthsimple GraphQL (read-only) + Trade REST buys. "
-            "GraphQL mutations stay blocked; real buys use trade-service (wsprobe buy) with your OAuth token. "
+            "Wealthsimple GraphQL (read-only). GraphQL mutations stay blocked. "
             "Easiest check: run wsprobe with no arguments — it tries common browsers for you."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -466,8 +388,6 @@ def build_parser() -> argparse.ArgumentParser:
             "  %(prog)s --cookies-from-browser firefox ping\n"
             "  %(prog)s --cookies-from-browser chrome security sec-s-…\n"
             "  %(prog)s preview-buy sec-s-… --shares 1 --order market --assume-price 264\n"
-            "  %(prog)s trade-accounts            list account ids (Trade REST)\n"
-            "  %(prog)s buy --symbol VFV.TO --shares 1 --confirm   market buy (easiest; one account)\n"
             "  %(prog)s export-session-snippet     print JS: paste on my.wealthsimple.com → session.json\n"
             "  %(prog)s session-path               print where session.json lives (~/.config/wsprobe/)\n"
             "  %(prog)s import-session tokens.json   save tokens to session.json (or stdin)\n"
@@ -620,47 +540,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON file; omit to read JSON from stdin",
     )
     sp.set_defaults(func=cmd_import_session)
-
-    sp = sub.add_parser(
-        "trade-accounts",
-        help="List Wealthsimple Trade account ids (uses OAuth token from cookies/env)",
-    )
-    sp.set_defaults(func=cmd_trade_accounts)
-
-    sp = sub.add_parser(
-        "buy",
-        help="REAL market buy via Wealthsimple Trade REST (same OAuth token as GraphQL)",
-    )
-    sp.add_argument(
-        "--account-id",
-        default=None,
-        metavar="ID",
-        help="Trade account id (optional if you only have one account; else see trade-accounts)",
-    )
-    buy_target = sp.add_mutually_exclusive_group(required=True)
-    buy_target.add_argument(
-        "--symbol",
-        metavar="TICKER",
-        help="Stock/ETF ticker to search (e.g. VFV.TO, AAPL)",
-    )
-    buy_target.add_argument(
-        "--security-id",
-        metavar="ID",
-        help="Security id sec-s-… (if you already copied it from the app URL)",
-    )
-    sp.add_argument(
-        "--shares",
-        type=float,
-        required=True,
-        metavar="N",
-        help="Share quantity",
-    )
-    sp.add_argument(
-        "--confirm",
-        action="store_true",
-        help="Required: acknowledge this submits a real order",
-    )
-    sp.set_defaults(func=cmd_buy)
 
     sp = sub.add_parser(
         "export-session-snippet",

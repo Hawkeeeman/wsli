@@ -6,7 +6,7 @@ python3 -m pip install --user -e .
 echo ""
 echo "Done. From this folder you can run:"
 echo "  python3 -m wsprobe"
-echo "Optional browser UI (pip install -e '.[web]'; real buys use Trade REST, same OAuth as wsprobe):"
+echo "Optional read-only browser UI (pip install -e '.[web]'), same OAuth as wsprobe:"
 echo "  wsprobe-serve"
 echo "  open http://127.0.0.1:8765/"
 echo "(Log in at my.wealthsimple.com, quit the browser, then run that.)"
