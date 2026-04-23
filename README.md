@@ -1,6 +1,6 @@
 # wsprobe
 
-Local CLI and optional web UI for Wealthsimple: read-only GraphQL, Trade REST for accounts/portfolio, and optional direct market buys (same OAuth session; not SnapTrade).
+Local CLI and optional web UI for Wealthsimple: read-only GraphQL, Trade REST for accounts/portfolio, and optional direct market buys (same OAuth session).
 
 ## Install
 

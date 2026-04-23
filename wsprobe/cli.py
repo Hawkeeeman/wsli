@@ -488,7 +488,7 @@ def cmd_preview_buy(args: argparse.Namespace) -> int:
     print("Preview complete: checks ran successfully.", file=sys.stderr)
     print("No order was submitted.", file=sys.stderr)
     print(
-        "To place a real market buy (Wealthsimple Trade REST, not SnapTrade):",
+        "To place a real market buy (Wealthsimple Trade REST):",
         file=sys.stderr,
     )
     print(
@@ -512,15 +512,28 @@ def _trade_rest_call(args: argparse.Namespace, func: Callable[[str], Any]) -> An
         raise
 
 
+def _list_trade_accounts_with_refresh(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """GraphQL account list + one refresh retry on 401 (same session as Trade REST)."""
+    from wsprobe import trade_service as ts
+
+    bundle, persist, _ = load_oauth_bundle(args)
+    injected = getattr(args, "access_token", None)
+    token = str(injected) if injected else ensure_fresh_access_token(bundle, persist_path=persist)
+    try:
+        return ts.list_accounts(token, oauth_bundle=bundle)
+    except RuntimeError as e:
+        if ("401" in str(e) or "HTTP 401" in str(e)) and bundle.get("refresh_token") and not injected:
+            token2 = ensure_fresh_access_token(bundle, persist_path=persist, force_refresh=True)
+            return ts.list_accounts(token2, oauth_bundle=bundle)
+        raise
+
+
 def cmd_accounts(args: argparse.Namespace) -> int:
     """List Trade accounts: balances and ids (for --account-id / --account-type)."""
     from wsprobe import trade_service as ts
 
-    def work(token: str) -> list[dict[str, Any]]:
-        return ts.list_accounts(token)
-
     try:
-        rows = _trade_rest_call(args, work)
+        rows = _list_trade_accounts_with_refresh(args)
     except Exception as e:
         print(str(e), file=sys.stderr)
         return 1
@@ -533,12 +546,15 @@ def cmd_accounts(args: argparse.Namespace) -> int:
         print("No Trade accounts returned.", file=sys.stderr)
         return 1
 
-    print("Wealthsimple Trade accounts (from trade-service). Use an id with buy/positions.", file=sys.stderr)
+    print("Wealthsimple Trade accounts (GraphQL). Ids work with buy / positions (Trade REST).", file=sys.stderr)
     print()
     for r in rows:
         aid = r.get("id") or "—"
-        raw_type = r.get("account_type") or "—"
-        label = ts.account_type_display(str(raw_type) if raw_type != "—" else None)
+        raw_type = r.get("account_type") or r.get("unified_account_type") or "—"
+        label = ts.account_type_display(str(r.get("account_type")) if r.get("account_type") else None)
+        if label == "—" and r.get("unified_account_type"):
+            u = str(r.get("unified_account_type"))
+            label = u.replace("SELF_DIRECTED_", "").replace("MANAGED_", "").replace("_", " ").strip() or "—"
         st = r.get("status") or "—"
         bp = ts.format_money(r.get("buying_power"))
         bal = ts.format_money(r.get("current_balance"))
@@ -556,11 +572,13 @@ def cmd_positions(args: argparse.Namespace) -> int:
     from wsprobe import trade_service as ts
 
     def work(token: str) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
-        accts = ts.list_accounts(token)
+        bundle, _, _ = load_oauth_bundle(args)
+        accts = ts.list_accounts(token, oauth_bundle=bundle)
         aid = ts.pick_trade_account_id(
             token,
             explicit_account_id=getattr(args, "account_id", None),
             account_type=getattr(args, "account_type", None),
+            oauth_bundle=bundle,
         )
         pos = ts.list_positions(token, aid)
         return aid, pos, accts
@@ -573,6 +591,9 @@ def cmd_positions(args: argparse.Namespace) -> int:
 
     acct = next((a for a in accounts if str(a.get("id")) == account_id), None)
     label = ts.account_type_display(str(acct.get("account_type")) if isinstance(acct, dict) else None)
+    if label == "—" and isinstance(acct, dict) and acct.get("unified_account_type"):
+        u = str(acct.get("unified_account_type"))
+        label = u.replace("SELF_DIRECTED_", "").replace("MANAGED_", "").replace("_", " ").strip() or "—"
 
     if args.json:
         print(
@@ -610,7 +631,8 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
     from wsprobe import trade_service as ts
 
     def work(token: str) -> list[dict[str, Any]]:
-        accounts = ts.list_accounts(token)
+        bundle, _, _ = load_oauth_bundle(args)
+        accounts = ts.list_accounts(token, oauth_bundle=bundle)
         blocks: list[dict[str, Any]] = []
         for acc in accounts:
             aid = str(acc.get("id") or "").strip()
@@ -639,8 +661,11 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
         acc = block["account"]
         positions = block["positions"]
         aid = acc.get("id")
-        raw_type = acc.get("account_type")
-        label = ts.account_type_display(str(raw_type) if raw_type else None)
+        raw_type = acc.get("account_type") or acc.get("unified_account_type")
+        label = ts.account_type_display(str(acc.get("account_type")) if acc.get("account_type") else None)
+        if label == "—" and acc.get("unified_account_type"):
+            u = str(acc.get("unified_account_type"))
+            label = u.replace("SELF_DIRECTED_", "").replace("MANAGED_", "").replace("_", " ").strip() or "—"
         print(f"=== {label} ({raw_type}) ===")
         print(f"account id:        {aid}")
         print(f"buying power:      {ts.format_money(acc.get('buying_power'))}")
@@ -665,7 +690,7 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
 def cmd_buy(args: argparse.Namespace) -> int:
     """
     Real market buy via Wealthsimple Trade REST (direct to trade-service).
-    Not SnapTrade. Requires explicit --confirm.
+    Requires explicit --confirm.
     """
     from wsprobe import trade_service as ts
 
@@ -681,7 +706,7 @@ def cmd_buy(args: argparse.Namespace) -> int:
     if not args.confirm:
         print(
             "This submits a REAL market BUY to Wealthsimple Trade (trade-service.wealthsimple.com).\n"
-            "It is a direct REST order — not SnapTrade, not GraphQL.\n"
+            "It is a direct REST order to trade-service, not GraphQL.\n"
             "Uses the same OAuth session as the rest of wsprobe (onboard / session.json).\n",
             file=sys.stderr,
         )
@@ -696,10 +721,12 @@ def cmd_buy(args: argparse.Namespace) -> int:
         return 1
 
     def submit(token: str) -> dict[str, Any]:
+        bundle, _, _ = load_oauth_bundle(args)
         account_id = ts.pick_trade_account_id(
             token,
             explicit_account_id=getattr(args, "buy_account_id", None),
             account_type=getattr(args, "buy_account_type", None),
+            oauth_bundle=bundle,
         )
         if has_sym:
             security_id = ts.symbol_to_security_id(token, str(sym).strip())
@@ -975,7 +1002,7 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         description=(
             "Wealthsimple: read-only GraphQL (mutations blocked in this tool) plus Trade REST "
             "for accounts, positions, portfolio, and optional real market buys (direct to "
-            "trade-service — not SnapTrade). If another program named wsprobe is on your PATH, "
+            "trade-service). If another program named wsprobe is on your PATH, "
             "use the wsp command (same install) or see --version for the package path."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1166,7 +1193,7 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
 
     sp = sub.add_parser(
         "buy",
-        help="Place a real market BUY on Wealthsimple Trade (REST). Not SnapTrade. Requires --confirm",
+        help="Place a real market BUY on Wealthsimple Trade (REST). Requires --confirm",
         description=(
             "Submits a market buy to trade-service.wealthsimple.com using your saved session. "
             "Choose the account with --account-id (from wsprobe accounts) or --account-type tfsa|rrsp|… "

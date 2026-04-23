@@ -13,6 +13,67 @@ query FetchIdentityPackages($id: ID!) {
 }
 """
 
+FETCH_TRADE_ACCOUNT_LIST = """
+query FetchTradeAccountList($identityId: ID!, $pageSize: Int = 50, $cursor: String) {
+  identity(id: $identityId) {
+    id
+    accounts(filter: {}, first: $pageSize, after: $cursor) {
+      pageInfo {
+        hasNextPage
+        endCursor
+        __typename
+      }
+      edges {
+        node {
+          id
+          status
+          unifiedAccountType
+          nickname
+          currency
+          custodianAccounts {
+            id
+            branch
+            status
+            financials {
+              current {
+                netLiquidationValue {
+                  amount
+                  currency
+                  __typename
+                }
+                __typename
+              }
+              __typename
+            }
+            __typename
+          }
+          financials {
+            currentCombined {
+              netLiquidationValue {
+                amount
+                currency
+                __typename
+              }
+              netDeposits {
+                amount
+                currency
+                __typename
+              }
+              __typename
+            }
+            __typename
+          }
+          __typename
+        }
+        __typename
+      }
+      __typename
+    }
+    __typename
+  }
+}
+"""
+
 FETCH_SECURITY = """
 query FetchSecurity($securityId: ID!) {
   security(id: $securityId) {
