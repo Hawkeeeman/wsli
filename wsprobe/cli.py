@@ -325,7 +325,14 @@ def cmd_preview_buy(args: argparse.Namespace) -> int:
     Read-only buy preflight using GraphQL queries only.
     Never submits, confirms, or finalizes an order.
     """
-    sid = _resolve_security_id_arg(args, args.security_id)
+    security_raw = getattr(args, "security_id", None)
+    symbol_raw = getattr(args, "preview_symbol", None)
+    if security_raw and symbol_raw:
+        raise SystemExit("Use either positional security/query or --symbol, not both.")
+    chosen = symbol_raw if symbol_raw else security_raw
+    if not chosen or not str(chosen).strip():
+        raise SystemExit("Provide a security id/search query (positional) or --symbol TICKER.")
+    sid = _resolve_security_id_arg(args, str(chosen))
     shares = float(args.shares)
     if shares <= 0:
         raise SystemExit("--shares must be positive")
@@ -492,7 +499,7 @@ def cmd_preview_buy(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     print(
-        "  wsprobe buy --symbol TICKER --shares N --account-type tfsa --confirm",
+        "  wsprobe buy --symbol TICKER --shares N --account-type tfsa --account-index 1 --confirm",
         file=sys.stderr,
     )
     print("  wsprobe buy --security-id sec-s-… --shares N --account-id <id> --confirm", file=sys.stderr)
@@ -548,7 +555,7 @@ def cmd_accounts(args: argparse.Namespace) -> int:
 
     print("Wealthsimple Trade accounts (GraphQL). Ids work with buy / positions (Trade REST).", file=sys.stderr)
     print()
-    for r in rows:
+    for i, r in enumerate(rows, start=1):
         aid = r.get("id") or "—"
         raw_type = r.get("account_type") or r.get("unified_account_type") or "—"
         label = ts.account_type_display(str(r.get("account_type")) if r.get("account_type") else None)
@@ -558,7 +565,7 @@ def cmd_accounts(args: argparse.Namespace) -> int:
         st = r.get("status") or "—"
         bp = ts.format_money(r.get("buying_power"))
         bal = ts.format_money(r.get("current_balance"))
-        print(f"  {label} ({raw_type})")
+        print(f"  {i}. {label} ({raw_type})")
         print(f"    account id:       {aid}")
         print(f"    status:           {st}")
         print(f"    buying power:     {bp}")
@@ -578,6 +585,7 @@ def cmd_positions(args: argparse.Namespace) -> int:
             token,
             explicit_account_id=getattr(args, "account_id", None),
             account_type=getattr(args, "account_type", None),
+            account_index=getattr(args, "account_index", None),
             oauth_bundle=bundle,
         )
         pos = ts.list_positions(token, aid)
@@ -694,14 +702,16 @@ def cmd_buy(args: argparse.Namespace) -> int:
     """
     from wsprobe import trade_service as ts
 
+    target = getattr(args, "buy_target", None)
     sym = getattr(args, "buy_symbol", None)
     sec_id = getattr(args, "buy_security_id", None)
     has_sym = bool(sym and str(sym).strip())
     has_sec = bool(sec_id and str(sec_id).strip())
-    if has_sym and has_sec:
-        raise SystemExit("Use either --symbol or --security-id, not both.")
-    if not has_sym and not has_sec:
-        raise SystemExit("Provide --symbol TICKER or --security-id sec-s-…")
+    has_target = bool(target and str(target).strip())
+    if (has_sym and has_sec) or (has_target and (has_sym or has_sec)):
+        raise SystemExit("Use exactly one of: positional query, --symbol, or --security-id.")
+    if not has_target and not has_sym and not has_sec:
+        raise SystemExit("Provide a positional ticker/query, --symbol TICKER, or --security-id sec-s-…")
 
     if not args.confirm:
         print(
@@ -713,7 +723,7 @@ def cmd_buy(args: argparse.Namespace) -> int:
         print(
             "Choose the account (TFSA is common for long-term investing; not tax advice):\n"
             "  wsprobe accounts\n"
-            "  wsprobe buy --symbol VFV.TO --shares 1 --account-type tfsa --confirm\n"
+            "  wsprobe buy VFV.TO --shares 1 --account-type tfsa --account-index 1 --confirm\n"
             "  wsprobe buy --security-id sec-s-… --shares 1 --account-id <id-from-accounts> --confirm\n",
             file=sys.stderr,
         )
@@ -726,9 +736,12 @@ def cmd_buy(args: argparse.Namespace) -> int:
             token,
             explicit_account_id=getattr(args, "buy_account_id", None),
             account_type=getattr(args, "buy_account_type", None),
+            account_index=getattr(args, "buy_account_index", None),
             oauth_bundle=bundle,
         )
-        if has_sym:
+        if has_target:
+            security_id = _resolve_security_id_arg(args, str(target).strip())
+        elif has_sym:
             security_id = ts.symbol_to_security_id(token, str(sym).strip())
         else:
             security_id = _normalize_security_id(str(sec_id).strip())
@@ -750,6 +763,106 @@ def cmd_buy(args: argparse.Namespace) -> int:
     else:
         print("Order submitted to Wealthsimple Trade (direct REST). Final status:", file=sys.stderr)
         print(format_json(out))
+    return 0
+
+
+def cmd_sell(args: argparse.Namespace) -> int:
+    """
+    Real market sell via Wealthsimple Trade REST (direct to trade-service).
+    Requires explicit --confirm.
+    """
+    from wsprobe import trade_service as ts
+
+    sym = getattr(args, "sell_symbol", None)
+    sec_id = getattr(args, "sell_security_id", None)
+    has_sym = bool(sym and str(sym).strip())
+    has_sec = bool(sec_id and str(sec_id).strip())
+    if has_sym and has_sec:
+        raise SystemExit("Use either --symbol or --security-id, not both.")
+    if not has_sym and not has_sec:
+        raise SystemExit("Provide --symbol TICKER or --security-id sec-s-…")
+
+    if not args.confirm:
+        print(
+            "This submits a REAL market SELL to Wealthsimple Trade (trade-service.wealthsimple.com).\n"
+            "It is a direct REST order to trade-service, not GraphQL.\n"
+            "Uses the same OAuth session as the rest of wsprobe (onboard / session.json).\n",
+            file=sys.stderr,
+        )
+        print(
+            "Choose the account:\n"
+            "  wsprobe accounts\n"
+            "  wsprobe sell --symbol VFV.TO --shares 1 --account-type tfsa --account-index 1 --confirm\n"
+            "  wsprobe sell --security-id sec-s-… --shares 1 --account-id <id-from-accounts> --confirm\n",
+            file=sys.stderr,
+        )
+        return 1
+
+    def submit(token: str) -> dict[str, Any]:
+        bundle, _, _ = load_oauth_bundle(args)
+        account_id = ts.pick_trade_account_id(
+            token,
+            explicit_account_id=getattr(args, "sell_account_id", None),
+            account_type=getattr(args, "sell_account_type", None),
+            account_index=getattr(args, "sell_account_index", None),
+            oauth_bundle=bundle,
+        )
+        if has_sym:
+            security_id = ts.symbol_to_security_id(token, str(sym).strip())
+        else:
+            security_id = _normalize_security_id(str(sec_id).strip())
+        return ts.place_market_sell(
+            token,
+            account_id=account_id,
+            security_id=security_id,
+            quantity=float(args.shares),
+        )
+
+    try:
+        out = _trade_rest_call(args, submit)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(format_json({"ok": True, "order": out}))
+    else:
+        print("Sell order submitted to Wealthsimple Trade (direct REST). Final status:", file=sys.stderr)
+        print(format_json(out))
+    return 0
+
+
+def cmd_funding(args: argparse.Namespace) -> int:
+    """Show available account cash context before placing trades (read-only)."""
+    from wsprobe import trade_service as ts
+
+    try:
+        rows = _list_trade_accounts_with_refresh(args)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        return 1
+
+    if args.json:
+        print(format_json({"funding": {"transfer_supported": False, "accounts": rows}}))
+        return 0
+
+    print("Funding view (read-only):", file=sys.stderr)
+    print("Transfers are not submitted by wsprobe yet. Use this to pick the funded account id.", file=sys.stderr)
+    print()
+    for i, r in enumerate(rows, start=1):
+        aid = r.get("id") or "—"
+        raw_type = r.get("account_type") or r.get("unified_account_type") or "—"
+        label = ts.account_type_display(str(r.get("account_type")) if r.get("account_type") else None)
+        if label == "—" and r.get("unified_account_type"):
+            u = str(r.get("unified_account_type"))
+            label = u.replace("SELF_DIRECTED_", "").replace("MANAGED_", "").replace("_", " ").strip() or "—"
+        print(f"{i}. {label} ({raw_type})")
+        print(f"   account id:      {aid}")
+        print(f"   buying power:    {ts.format_money(r.get('buying_power'))}")
+        print(f"   current balance: {ts.format_money(r.get('current_balance'))}")
+        print()
+    print("Example buy after funding:")
+    print("  wsprobe buy --symbol VFV.TO --shares 1 --account-type tfsa --account-index 1 --confirm")
     return 0
 
 
@@ -1001,7 +1114,7 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         prog=inv,
         description=(
             "Wealthsimple: read-only GraphQL (mutations blocked in this tool) plus Trade REST "
-            "for accounts, positions, portfolio, and optional real market buys (direct to "
+            "for accounts, positions, portfolio, funding view, and optional real market orders (direct to "
             "trade-service). If another program named wsprobe is on your PATH, "
             "use the wsp command (same install) or see --version for the package path."
         ),
@@ -1021,9 +1134,11 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
             "  %(prog)s doctor             credentials + GraphQL health (try this if auth fails)\n"
             "  %(prog)s accounts            Trade accounts (ids, TFSA/RRSP, buying power)\n"
             "  %(prog)s portfolio           all accounts: cash + holdings\n"
+            "  %(prog)s funding             read-only funding/account cash view\n"
             "  %(prog)s positions --account-type tfsa   holdings in one account\n"
             "  %(prog)s preview-buy …       read-only buy checks (no order)\n"
-            "  %(prog)s buy --symbol X --shares 1 --account-type tfsa --confirm   real market buy\n"
+            "  %(prog)s buy X --shares 1 --account-type tfsa --account-index 1 --confirm   real market buy\n"
+            "  %(prog)s sell --symbol X --shares 1 --account-type tfsa --account-index 1 --confirm  real market sell\n"
             "  %(prog)s export-session-snippet     print JS: paste on my.wealthsimple.com → session.json\n"
             "  %(prog)s session-path               print where session.json lives (~/.config/wsprobe/)\n"
             "  %(prog)s import-session tokens.json   save tokens to session.json (or stdin)\n"
@@ -1129,7 +1244,18 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         "preview-buy",
         help="Read-only buy preflight (queries only; never submits an order)",
     )
-    sp.add_argument("security_id", help="Wealthsimple security id, e.g. sec-s-…")
+    sp.add_argument(
+        "security_id",
+        nargs="?",
+        help="Security id or search text (ticker/name), e.g. sec-s-… or AIDX",
+    )
+    sp.add_argument(
+        "--symbol",
+        dest="preview_symbol",
+        default=None,
+        metavar="TICKER",
+        help="Ticker/search text instead of positional arg",
+    )
     sp.add_argument(
         "--shares",
         type=float,
@@ -1181,7 +1307,15 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         dest="account_type",
         default=None,
         metavar="TYPE",
-        help="Shorthand: tfsa, rrsp, resp, fhsa, joint, non_registered, … (exactly one account must match)",
+        help="Shorthand: tfsa, rrsp, resp, fhsa, joint, non_registered, … (or add --account-index for duplicates)",
+    )
+    sp.add_argument(
+        "--account-index",
+        dest="account_index",
+        type=int,
+        default=None,
+        metavar="N",
+        help="1-based index among matched accounts (use with --account-type when you have duplicates)",
     )
     sp.set_defaults(func=cmd_positions)
 
@@ -1192,14 +1326,27 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_portfolio)
 
     sp = sub.add_parser(
+        "funding",
+        help="Funding view: read-only account cash and buying power",
+    )
+    sp.set_defaults(func=cmd_funding)
+
+    sp = sub.add_parser(
         "buy",
         help="Place a real market BUY on Wealthsimple Trade (REST). Requires --confirm",
         description=(
             "Submits a market buy to trade-service.wealthsimple.com using your saved session. "
             "Choose the account with --account-id (from wsprobe accounts) or --account-type tfsa|rrsp|… "
+            "When multiple accounts match a type (e.g. 2 TFSAs), pass --account-index. "
             "When you have only one Trade account, that account is used automatically."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sp.add_argument(
+        "buy_target",
+        nargs="?",
+        metavar="TARGET",
+        help="Ticker/search text or security id (same shorthand style as preview-buy)",
     )
     sp.add_argument(
         "--symbol",
@@ -1235,7 +1382,15 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         dest="buy_account_type",
         default=None,
         metavar="TYPE",
-        help="tfsa, rrsp, resp, fhsa, … — must match exactly one account",
+        help="tfsa, rrsp, resp, fhsa, … — must match exactly one account unless --account-index is used",
+    )
+    sp.add_argument(
+        "--account-index",
+        dest="buy_account_index",
+        type=int,
+        default=None,
+        metavar="N",
+        help="1-based index among accounts matched by --account-type",
     )
     sp.add_argument(
         "--confirm",
@@ -1243,6 +1398,67 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         help="Required to actually submit the order (safety latch)",
     )
     sp.set_defaults(func=cmd_buy)
+
+    sp = sub.add_parser(
+        "sell",
+        help="Place a real market SELL on Wealthsimple Trade (REST). Requires --confirm",
+        description=(
+            "Submits a market sell to trade-service.wealthsimple.com using your saved session. "
+            "Choose the account with --account-id (from wsprobe accounts) or --account-type tfsa|rrsp|… "
+            "When multiple accounts match a type, pass --account-index."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sp.add_argument(
+        "--symbol",
+        "-s",
+        dest="sell_symbol",
+        default=None,
+        metavar="TICKER",
+        help="Ticker (e.g. VFV.TO); resolved via Trade search",
+    )
+    sp.add_argument(
+        "--security-id",
+        dest="sell_security_id",
+        default=None,
+        metavar="sec-s-…",
+        help="Wealthsimple security id instead of --symbol",
+    )
+    sp.add_argument(
+        "--shares",
+        type=float,
+        required=True,
+        metavar="N",
+        help="Share quantity to sell",
+    )
+    sp.add_argument(
+        "--account-id",
+        dest="sell_account_id",
+        default=None,
+        metavar="ID",
+        help="Trade account id (from wsprobe accounts)",
+    )
+    sp.add_argument(
+        "--account-type",
+        dest="sell_account_type",
+        default=None,
+        metavar="TYPE",
+        help="tfsa, rrsp, resp, fhsa, … — must match exactly one account unless --account-index is used",
+    )
+    sp.add_argument(
+        "--account-index",
+        dest="sell_account_index",
+        type=int,
+        default=None,
+        metavar="N",
+        help="1-based index among accounts matched by --account-type",
+    )
+    sp.add_argument(
+        "--confirm",
+        action="store_true",
+        help="Required to actually submit the order (safety latch)",
+    )
+    sp.set_defaults(func=cmd_sell)
 
     sp = sub.add_parser(
         "restrictions",

@@ -20,6 +20,16 @@ from wsprobe.queries import FETCH_TRADE_ACCOUNT_LIST
 TRADE_SERVICE_BASE = "https://trade-service.wealthsimple.com"
 _TRANSIENT_ORDER_STATUSES = {"", "new", "pending", "queued", "accepted", "open", "submitted", "in_progress"}
 
+
+def _raise_trade_rest_unavailable(endpoint: str, status: int, payload: Any) -> None:
+    if status == 404:
+        raise RuntimeError(
+            "Wealthsimple Trade REST endpoint is unavailable: "
+            f"{endpoint} returned 404. The web app now submits orders through GraphQL, "
+            "and wsprobe currently blocks GraphQL mutations. Use the web app to place the order."
+        )
+    raise RuntimeError(f"{endpoint} HTTP {status}: {payload}")
+
 # CLI --account-type aliases → legacy REST account_type values (ca_*), matched after GraphQL mapping.
 _ACCOUNT_TYPE_ALIASES: dict[str, tuple[str, ...]] = {
     "tfsa": ("ca_tfsa",),
@@ -207,7 +217,7 @@ def search_securities(access_token: str, query: str) -> list[dict[str, Any]]:
     q = quote(query.strip(), safe="")
     status, body = _request("GET", f"/securities?query={q}", access_token=access_token)
     if status != 200:
-        raise RuntimeError(f"securities?query= HTTP {status}: {body}")
+        _raise_trade_rest_unavailable("securities?query=", status, body)
     if not isinstance(body, dict):
         raise RuntimeError(f"Unexpected securities search response: {body}")
     results = body.get("results")
@@ -333,13 +343,15 @@ def pick_trade_account_id(
     *,
     explicit_account_id: str | None,
     account_type: str | None,
+    account_index: int | None = None,
     oauth_bundle: dict[str, Any] | None = None,
 ) -> str:
     """
     Resolve which Trade account id to use for orders or positions.
 
     - explicit_account_id wins if set (must exist in the GraphQL account list).
-    - Else if account_type is set (e.g. tfsa, rrsp), match exactly one account.
+    - Else if account_type is set (e.g. tfsa, rrsp), match exactly one account
+      unless --account-index is provided.
     - Else if there is exactly one account, use it.
     - Else require the user to disambiguate (wsprobe accounts).
     """
@@ -353,14 +365,34 @@ def pick_trade_account_id(
         return aid
 
     if account_type and str(account_type).strip():
+        raw_selector = str(account_type).strip()
+        exact_id_match = next((r for r in rows if str(r.get("id") or "") == raw_selector), None)
+        if exact_id_match is not None:
+            rid = exact_id_match.get("id")
+            if not rid:
+                raise RuntimeError("Matched account missing id")
+            return str(rid)
         acceptable = _account_types_for_filter(str(account_type))
         matches = [r for r in rows if str(r.get("account_type") or "") in acceptable]
+        if account_index is not None:
+            idx = int(account_index)
+            if idx < 1:
+                raise RuntimeError("--account-index must be >= 1")
+            if idx > len(matches):
+                raise RuntimeError(
+                    f"--account-index {idx} is out of range for type {account_type!r}; "
+                    f"found {len(matches)} match(es)."
+                )
+            rid = matches[idx - 1].get("id")
+            if not rid:
+                raise RuntimeError("Matched account missing id")
+            return str(rid)
         if len(matches) != 1:
             found = [(r.get("id"), r.get("account_type")) for r in rows]
             raise RuntimeError(
                 f"Expected exactly one account for type {account_type!r} "
                 f"(matches {acceptable}); found {len(matches)}. Accounts: {found}. "
-                "Use --account-id from `wsprobe accounts` or a more specific --account-type."
+                "Use --account-id from `wsprobe accounts` or pass --account-index N."
             )
         rid = matches[0].get("id")
         if not rid:
@@ -378,11 +410,21 @@ def pick_trade_account_id(
             "Only one open account was returned and it does not look like a Trade brokerage account "
             "(no mapped type and no WS/TR custodian). Use --account-id with a self-directed account id."
         )
+    if account_index is not None:
+        idx = int(account_index)
+        if idx < 1:
+            raise RuntimeError("--account-index must be >= 1")
+        if idx > len(rows):
+            raise RuntimeError(f"--account-index {idx} is out of range; found {len(rows)} account(s).")
+        rid = rows[idx - 1].get("id")
+        if not rid:
+            raise RuntimeError("Selected account missing id")
+        return str(rid)
     preview = [(r.get("id"), r.get("account_type")) for r in rows]
     raise RuntimeError(
         "You have multiple Trade accounts — choose one:\n"
         "  wsprobe accounts\n"
-        "Then pass  --account-id <id>  or  --account-type tfsa|rrsp|resp|…  "
+        "Then pass  --account-id <id>  or  --account-type tfsa|rrsp|resp|… [--account-index N]  "
         f"(accounts: {preview})"
     )
 
@@ -391,7 +433,7 @@ def get_security(access_token: str, security_id: str) -> dict[str, Any]:
     sid = security_id.strip()
     status, body = _request("GET", f"/securities/{sid}", access_token=access_token)
     if status != 200:
-        raise RuntimeError(f"securities/{sid[:16]}… HTTP {status}: {body}")
+        _raise_trade_rest_unavailable(f"securities/{sid[:16]}…", status, body)
     if not isinstance(body, dict):
         raise RuntimeError(f"Unexpected security response: {body}")
     return body
@@ -495,7 +537,60 @@ def place_market_buy(
 
     status, resp = _request("POST", "/orders", access_token=access_token, json_body=body)
     if status not in (200, 201):
-        raise RuntimeError(f"orders HTTP {status}: {resp}")
+        _raise_trade_rest_unavailable("orders", status, resp)
+    if not isinstance(resp, dict):
+        raise RuntimeError(f"Unexpected order response: {resp}")
+    return wait_for_order_finalization(
+        access_token,
+        _order_id(resp),
+        timeout_s=finalize_timeout_s,
+    )
+
+
+def place_market_sell(
+    access_token: str,
+    *,
+    account_id: str,
+    security_id: str,
+    quantity: float,
+    finalize_timeout_s: float = 30.0,
+) -> dict[str, Any]:
+    """
+    POST /orders — market sell on Wealthsimple Trade (direct REST).
+
+    For equities, includes limit_price from live quote.
+    """
+    if quantity <= 0:
+        raise ValueError("quantity must be positive")
+    aid = account_id.strip()
+    sid = security_id.strip()
+    if not aid or not sid:
+        raise ValueError("account_id and security_id are required")
+
+    details = get_security(access_token, sid)
+    crypto = _is_crypto(details)
+    quote = details.get("quote") if isinstance(details.get("quote"), dict) else {}
+    amount_raw = quote.get("amount") if isinstance(quote, dict) else None
+
+    body: dict[str, Any] = {
+        "account_id": aid,
+        "security_id": sid,
+        "quantity": float(quantity),
+        "order_type": "sell_quantity",
+        "order_sub_type": "market",
+        "time_in_force": "day",
+    }
+    if not crypto:
+        if amount_raw is None:
+            raise RuntimeError(
+                "No quote.amount on security; cannot build market sell. "
+                "Check security id or try again when quotes are available."
+            )
+        body["limit_price"] = float(amount_raw)
+
+    status, resp = _request("POST", "/orders", access_token=access_token, json_body=body)
+    if status not in (200, 201):
+        _raise_trade_rest_unavailable("orders", status, resp)
     if not isinstance(resp, dict):
         raise RuntimeError(f"Unexpected order response: {resp}")
     return wait_for_order_finalization(
