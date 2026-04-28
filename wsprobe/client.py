@@ -11,13 +11,6 @@ GRAPHQL_URL = "https://my.wealthsimple.com/graphql"
 DEFAULT_API_VERSION = "12"
 
 
-def _assert_query_only(document: str) -> None:
-    """Block mutations so orders can never be submitted/finalized via this tool."""
-    stripped = document.lstrip()
-    if stripped.lower().startswith("mutation"):
-        raise ValueError("wsprobe refuses GraphQL mutations (no submit/finalize)")
-
-
 def identity_id_from_token(token: str) -> str | None:
     parts = token.split(".")
     if len(parts) < 2:
@@ -66,8 +59,6 @@ def graphql_request(
     oauth_bundle: dict[str, Any] | None = None,
     timeout_s: float = 30.0,
 ) -> tuple[int, dict[str, Any] | None, str | None]:
-    _assert_query_only(query)
-
     identity_id = identity_id_for_graphql(access_token, oauth_bundle)
     headers = {
         "accept": "*/*",

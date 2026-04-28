@@ -1,4 +1,4 @@
-"""GraphQL query documents for wsprobe (queries only — no mutations)."""
+"""GraphQL documents for wsprobe."""
 
 FETCH_IDENTITY_PACKAGES = """
 query FetchIdentityPackages($id: ID!) {
@@ -149,6 +149,60 @@ query FetchSecuritySearchResult($query: String!) {
       }
       __typename
     }
+    __typename
+  }
+}
+"""
+
+MUTATION_SO_ORDERS_ORDER_CREATE = """
+mutation SoOrdersOrderCreate($input: SoOrders_CreateOrderInput!) {
+  soOrdersCreateOrder(input: $input) {
+    errors {
+      code
+      message
+      __typename
+    }
+    order {
+      orderId
+      createdAt
+      __typename
+    }
+    __typename
+  }
+}
+"""
+
+FETCH_SO_ORDERS_EXTENDED_ORDER = """
+query FetchSoOrdersExtendedOrder($branchId: String!, $externalId: String!) {
+  soOrdersExtendedOrder(branchId: $branchId, externalId: $externalId) {
+    averageFilledPrice
+    filledExchangeRate
+    filledQuantity
+    filledCommissionFee
+    filledTotalFee
+    firstFilledAtUtc
+    lastFilledAtUtc
+    limitPrice
+    openClose
+    orderType
+    optionMultiplier
+    rejectionCause
+    rejectionCode
+    securityCurrency
+    status
+    stopPrice
+    submittedAtUtc
+    submittedExchangeRate
+    submittedNetValue
+    submittedQuantity
+    submittedTotalFee
+    timeInForce
+    accountId
+    canonicalAccountId
+    cancellationCutoff
+    tradingSession
+    expiredAtUtc
+    securityId
     __typename
   }
 }

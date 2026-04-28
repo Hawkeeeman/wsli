@@ -738,6 +738,7 @@ def cmd_buy(args: argparse.Namespace) -> int:
             account_type=getattr(args, "buy_account_type", None),
             account_index=getattr(args, "buy_account_index", None),
             oauth_bundle=bundle,
+            require_trade_orderable=True,
         )
         if has_target:
             security_id = _resolve_security_id_arg(args, str(target).strip())
@@ -806,6 +807,7 @@ def cmd_sell(args: argparse.Namespace) -> int:
             account_type=getattr(args, "sell_account_type", None),
             account_index=getattr(args, "sell_account_index", None),
             oauth_bundle=bundle,
+            require_trade_orderable=True,
         )
         if has_sym:
             security_id = ts.symbol_to_security_id(token, str(sym).strip())

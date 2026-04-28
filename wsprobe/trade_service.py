@@ -11,11 +11,17 @@ import ssl
 import time
 import urllib.error
 import urllib.request
+import uuid
 from typing import Any
 from urllib.parse import quote
 
 from wsprobe.client import graphql_request, identity_id_for_graphql
-from wsprobe.queries import FETCH_TRADE_ACCOUNT_LIST
+from wsprobe.queries import (
+    FETCH_SECURITY_QUOTES,
+    FETCH_SO_ORDERS_EXTENDED_ORDER,
+    FETCH_TRADE_ACCOUNT_LIST,
+    MUTATION_SO_ORDERS_ORDER_CREATE,
+)
 
 TRADE_SERVICE_BASE = "https://trade-service.wealthsimple.com"
 _TRANSIENT_ORDER_STATUSES = {"", "new", "pending", "queued", "accepted", "open", "submitted", "in_progress"}
@@ -338,6 +344,18 @@ def _account_types_for_filter(user_type: str) -> tuple[str, ...]:
     return (f"ca_{u}",)
 
 
+def _is_trade_orderable_account(row: dict[str, Any]) -> bool:
+    if not isinstance(row, dict):
+        return False
+    unified = str(row.get("unified_account_type") or "").strip().upper()
+    if unified == "CASH":
+        return False
+    if bool(row.get("trade_custodian")):
+        return True
+    # Keep this permissive for known self-directed brokerage account types.
+    return bool(str(row.get("account_type") or "").strip())
+
+
 def pick_trade_account_id(
     access_token: str,
     *,
@@ -345,6 +363,7 @@ def pick_trade_account_id(
     account_type: str | None,
     account_index: int | None = None,
     oauth_bundle: dict[str, Any] | None = None,
+    require_trade_orderable: bool = False,
 ) -> str:
     """
     Resolve which Trade account id to use for orders or positions.
@@ -358,9 +377,16 @@ def pick_trade_account_id(
     rows = list_accounts(access_token, oauth_bundle=oauth_bundle)
     if explicit_account_id and str(explicit_account_id).strip():
         aid = str(explicit_account_id).strip()
-        if not any(str(r.get("id")) == aid for r in rows):
+        row = next((r for r in rows if str(r.get("id")) == aid), None)
+        if row is None:
             raise RuntimeError(
                 f"No Trade account with id {aid!r}. Run: wsprobe accounts — ids come from that list."
+            )
+        if require_trade_orderable and not _is_trade_orderable_account(row):
+            raise RuntimeError(
+                f"Account {aid!r} is not orderable for stock/ETF trades in this flow "
+                "(its custodian branch is not WS/TR). Choose a self-directed brokerage account "
+                "from `wsprobe accounts` (for example TFSA/RRSP/non-registered)."
             )
         return aid
 
@@ -374,6 +400,8 @@ def pick_trade_account_id(
             return str(rid)
         acceptable = _account_types_for_filter(str(account_type))
         matches = [r for r in rows if str(r.get("account_type") or "") in acceptable]
+        if require_trade_orderable:
+            matches = [r for r in matches if _is_trade_orderable_account(r)]
         if account_index is not None:
             idx = int(account_index)
             if idx < 1:
@@ -404,6 +432,11 @@ def pick_trade_account_id(
         rid = r0.get("id")
         if not rid:
             raise RuntimeError("Account list entry missing id")
+        if require_trade_orderable and not _is_trade_orderable_account(r0):
+            raise RuntimeError(
+                "Only one account is available and it is not orderable for stock/ETF trades in this flow "
+                "(custodian branch is not WS/TR). Use a self-directed brokerage account id."
+            )
         if r0.get("account_type") or r0.get("trade_custodian"):
             return str(rid)
         raise RuntimeError(
@@ -502,48 +535,105 @@ def place_market_buy(
     quantity: float,
     finalize_timeout_s: float = 30.0,
 ) -> dict[str, Any]:
-    """
-    POST /orders — market buy on Wealthsimple Trade (direct REST).
-
-    For equities, includes limit_price from live quote (required by WS for market buys).
-    """
     if quantity <= 0:
         raise ValueError("quantity must be positive")
     aid = account_id.strip()
     sid = security_id.strip()
     if not aid or not sid:
         raise ValueError("account_id and security_id are required")
+    external_id = f"order-{uuid.uuid4()}"
+    exec_type = "FRACTIONAL" if quantity % 1 else "REGULAR"
+    order_type = "BUY_QUANTITY"
+    payload_amount: float | None = None
 
-    details = get_security(access_token, sid)
-    crypto = _is_crypto(details)
-    quote = details.get("quote") if isinstance(details.get("quote"), dict) else {}
-    amount_raw = quote.get("amount") if isinstance(quote, dict) else None
+    if exec_type == "FRACTIONAL":
+        st_q, pl_q, raw_q = graphql_request(
+            access_token=access_token,
+            operation_name="FetchIntraDayChartQuotes",
+            query=FETCH_SECURITY_QUOTES,
+            variables={
+                "id": sid,
+                "date": None,
+                "tradingSession": "OVERNIGHT",
+                "currency": None,
+                "period": "ONE_DAY",
+            },
+        )
+        if st_q != 200 or not isinstance(pl_q, dict):
+            raise RuntimeError(f"FetchIntraDayChartQuotes HTTP {st_q}: {raw_q or pl_q}")
+        if pl_q.get("errors"):
+            raise RuntimeError(f"FetchIntraDayChartQuotes errors: {pl_q['errors']}")
+        bars = (((pl_q.get("data") or {}).get("security") or {}).get("chartBarQuotes") or [])
+        prices = []
+        for b in bars:
+            if isinstance(b, dict):
+                p = b.get("price")
+                try:
+                    if p is not None:
+                        prices.append(float(p))
+                except (TypeError, ValueError):
+                    pass
+        if not prices:
+            raise RuntimeError("No market price available for fractional BUY_VALUE conversion.")
+        payload_amount = round(max(float(quantity) * prices[-1], 0.01), 2)
+        if payload_amount <= 0:
+            raise RuntimeError("Computed fractional order value is not positive.")
+        order_type = "BUY_VALUE"
 
-    body: dict[str, Any] = {
-        "account_id": aid,
-        "security_id": sid,
-        "quantity": float(quantity),
-        "order_type": "buy_quantity",
-        "order_sub_type": "market",
-        "time_in_force": "day",
+    input_payload: dict[str, Any] = {
+        "canonicalAccountId": aid,
+        "externalId": external_id,
+        "executionType": exec_type,
+        "orderType": order_type,
+        "securityId": sid,
+        "timeInForce": None if exec_type == "FRACTIONAL" else "DAY",
     }
-    if not crypto:
-        if amount_raw is None:
-            raise RuntimeError(
-                "No quote.amount on security; cannot build market buy. "
-                "Check security id or try again when quotes are available."
-            )
-        body["limit_price"] = float(amount_raw)
+    if order_type == "BUY_VALUE":
+        input_payload["value"] = payload_amount
+    else:
+        input_payload["quantity"] = float(quantity)
 
-    status, resp = _request("POST", "/orders", access_token=access_token, json_body=body)
-    if status not in (200, 201):
-        _raise_trade_rest_unavailable("orders", status, resp)
-    if not isinstance(resp, dict):
-        raise RuntimeError(f"Unexpected order response: {resp}")
-    return wait_for_order_finalization(
-        access_token,
-        _order_id(resp),
-        timeout_s=finalize_timeout_s,
+    st, pl, raw = graphql_request(
+        access_token=access_token,
+        operation_name="SoOrdersOrderCreate",
+        query=MUTATION_SO_ORDERS_ORDER_CREATE,
+        variables={"input": input_payload},
+    )
+    if st != 200 or not isinstance(pl, dict):
+        raise RuntimeError(f"SoOrdersOrderCreate HTTP {st}: {raw or pl}")
+    if pl.get("errors"):
+        raise RuntimeError(f"SoOrdersOrderCreate errors: {pl['errors']}")
+    block = (pl.get("data") or {}).get("soOrdersCreateOrder")
+    if not isinstance(block, dict):
+        raise RuntimeError(f"SoOrdersOrderCreate missing response block: {pl}")
+    create_errors = block.get("errors")
+    if isinstance(create_errors, list) and create_errors:
+        raise RuntimeError(f"SoOrdersOrderCreate rejected: {create_errors}")
+
+    deadline = time.monotonic() + max(finalize_timeout_s, 0.1)
+    last: dict[str, Any] | None = None
+    while True:
+        st2, pl2, raw2 = graphql_request(
+            access_token=access_token,
+            operation_name="FetchSoOrdersExtendedOrder",
+            query=FETCH_SO_ORDERS_EXTENDED_ORDER,
+            variables={"branchId": "TR", "externalId": external_id},
+        )
+        if st2 != 200 or not isinstance(pl2, dict):
+            raise RuntimeError(f"FetchSoOrdersExtendedOrder HTTP {st2}: {raw2 or pl2}")
+        if pl2.get("errors"):
+            raise RuntimeError(f"FetchSoOrdersExtendedOrder errors: {pl2['errors']}")
+        order = (pl2.get("data") or {}).get("soOrdersExtendedOrder")
+        if isinstance(order, dict):
+            last = order
+            status = str(order.get("status") or "").lower().strip()
+            if status and status not in _TRANSIENT_ORDER_STATUSES:
+                return order
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(1.0)
+    raise RuntimeError(
+        f"Order {external_id} did not finalize within {finalize_timeout_s:g}s (last status: {last})"
     )
 
 
