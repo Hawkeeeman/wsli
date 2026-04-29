@@ -24,10 +24,19 @@ Or from this repo, `python3 -m wsprobe …` always uses this tree. After `pip in
 ```bash
 wsp onboard
 wsp ping
+wsp keepalive
 # or: python3 -m wsprobe
 ```
 
 `wsp onboard` prints a console snippet for `my.wealthsimple.com`, then waits for you to paste the snippet output back into the terminal and saves it to `~/.config/wsprobe/session.json`.
+
+After `wsp onboard` (or `wsp import-session`), `wsprobe` now auto-starts `wsp keepalive` in the background by default (disable with `--no-auto-keepalive`).
+The background process writes logs to `~/.config/wsprobe/keepalive.log` and PID to `~/.config/wsprobe/keepalive.pid`.
+Structured refresh history is also saved to `~/.config/wsprobe/refresh_history.jsonl` and can be viewed with `wsp logs` (or `wsprobe logs`).
+Buy history is saved to `~/.config/wsprobe/buy_history.jsonl` for successful `buy` commands and can be viewed with `wsp history` (or `wsprobe history`).
+
+`wsp keepalive` now uses an adaptive auth probe loop: token health is read from `/v1/oauth/v2/token/info`, probe cadence shifts between active and idle windows using `wsstg::lastActivityTime` and `wsstg::sessionInactivityTimeoutMinutes`, and refresh decisions are driven by live `expires_in` bands (prepare, refresh, and critical windows). Refresh attempts are verified by checking token rollover (`created_at` or a significant `expires_in` jump), with transient retry backoff before session degradation. If refresh still fails, it can recover from a logged-in browser session (disable with `--no-browser-recover`).
+`wsp logs --limit 100` is read-only and only prints history; it does not trigger network auth activity.
 
 ## Local web UI
 

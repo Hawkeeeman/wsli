@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 import ssl
 import time
 import urllib.error
@@ -15,6 +16,64 @@ DEFAULT_OAUTH_CLIENT_ID = (
 )
 
 OAUTH_TOKEN_URL = "https://api.production.wealthsimple.com/v1/oauth/v2/token"
+OAUTH_TOKEN_INFO_URL = "https://api.production.wealthsimple.com/v1/oauth/v2/token/info"
+SESSION_INFO_URL = "https://api.production.wealthsimple.com/api/sessions"
+
+
+class AuthRequestError(RuntimeError):
+    def __init__(self, message: str, *, status: int | None = None, transient: bool = False) -> None:
+        super().__init__(message)
+        self.status = status
+        self.transient = transient
+
+
+def _auth_json_request(
+    method: str,
+    url: str,
+    *,
+    timeout_s: float,
+    access_token: str | None = None,
+    json_body: dict[str, Any] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "origin": "https://my.wealthsimple.com",
+        "x-wealthsimple-client": "@wealthsimple/wealthsimple",
+    }
+    if access_token:
+        headers["authorization"] = f"Bearer {access_token}"
+    data = json.dumps(json_body).encode("utf-8") if json_body is not None else None
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s, context=ctx) as resp:
+            status = getattr(resp, "status", 200) or 200
+            text = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        text = e.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(text) if text.strip() else {}
+        except json.JSONDecodeError:
+            payload = {"_raw_preview": " ".join(text.split())[:320]}
+        raise AuthRequestError(
+            f"Auth endpoint failed HTTP {status}: {payload}",
+            status=status,
+            transient=status >= 500,
+        ) from None
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise AuthRequestError(
+            f"Auth endpoint network error: {e}",
+            transient=True,
+        ) from e
+    try:
+        payload = json.loads(text) if text.strip() else {}
+    except json.JSONDecodeError as e:
+        raise AuthRequestError(f"Auth endpoint invalid JSON: {text[:300]}") from e
+    if not isinstance(payload, dict):
+        raise AuthRequestError(f"Auth endpoint invalid payload type: {type(payload).__name__}")
+    return status, payload
 
 
 def jwt_exp_unix(access_token: str) -> int | None:
@@ -59,53 +118,46 @@ def refresh_access_token(
     if not rt:
         raise ValueError("refresh_token is empty")
 
-    body = json.dumps(
-        {
+    status, out = _auth_json_request(
+        "POST",
+        OAUTH_TOKEN_URL,
+        timeout_s=timeout_s,
+        json_body={
             "grant_type": "refresh_token",
             "refresh_token": rt,
             "client_id": client_id,
-        }
-    ).encode("utf-8")
-
-    req = urllib.request.Request(
-        OAUTH_TOKEN_URL,
-        data=body,
-        headers={
-            "accept": "application/json",
-            "content-type": "application/json",
-            "origin": "https://my.wealthsimple.com",
-            "x-wealthsimple-client": "@wealthsimple/wealthsimple",
         },
-        method="POST",
     )
-    ctx = ssl.create_default_context()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s, context=ctx) as resp:
-            status = getattr(resp, "status", 200) or 200
-            text = resp.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as e:
-        status = e.code
-        text = e.read().decode("utf-8", errors="replace")
-        try:
-            err_body = json.loads(text)
-        except json.JSONDecodeError:
-            preview = " ".join(text.split())
-            if len(preview) > 320:
-                preview = preview[:320] + "..."
-            err_body = {"_raw_preview": preview}
-        raise RuntimeError(
-            f"OAuth refresh failed HTTP {status}: {err_body}"
-        ) from None
-
     if status != 200:
-        raise RuntimeError(f"OAuth refresh unexpected HTTP {status}: {text[:500]}")
-
-    try:
-        out = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"OAuth refresh invalid JSON: {text[:300]}") from e
-
-    if not isinstance(out, dict) or not out.get("access_token"):
+        raise RuntimeError(f"OAuth refresh unexpected HTTP {status}: {out}")
+    if not out.get("access_token"):
         raise RuntimeError(f"OAuth refresh missing access_token: {out!r}")
-
     return out
+
+
+def get_token_info(access_token: str, *, timeout_s: float = 20.0) -> dict[str, Any]:
+    status, payload = _auth_json_request(
+        "GET",
+        OAUTH_TOKEN_INFO_URL,
+        timeout_s=timeout_s,
+        access_token=access_token.strip(),
+    )
+    if status != 200:
+        raise AuthRequestError(f"Token info unexpected HTTP {status}", status=status)
+    return payload
+
+
+def get_session_info(access_token: str, *, timeout_s: float = 20.0) -> dict[str, Any]:
+    status, payload = _auth_json_request(
+        "GET",
+        SESSION_INFO_URL,
+        timeout_s=timeout_s,
+        access_token=access_token.strip(),
+    )
+    if status != 200:
+        raise AuthRequestError(f"Session info unexpected HTTP {status}", status=status)
+    return payload
+
+
+def jitter_delay(base_s: float) -> float:
+    return max(0.0, base_s + random.uniform(0.0, min(1.0, base_s * 0.25)))

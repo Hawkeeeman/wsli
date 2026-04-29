@@ -1,21 +1,34 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
+import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import unquote
 
 from wsprobe import __version__
+from wsprobe.browser_cookies import oauth2_bundle_first_available
 from wsprobe.client import (
     format_json,
     graphql_request,
     identity_id_for_graphql,
 )
 from wsprobe.oauth_refresh import access_token_needs_refresh, jwt_exp_unix
+from wsprobe.oauth_refresh import (
+    AuthRequestError,
+    get_session_info,
+    get_token_info,
+    jitter_delay,
+    refresh_access_token,
+)
 from wsprobe.credentials import (
+    CONFIG_DIR,
     CONFIG_FILE,
     SESSION_FILE,
     _persist_bundle,
@@ -33,6 +46,160 @@ from wsprobe.queries import (
 )
 
 _PACKAGE_DIR = str(Path(__file__).resolve().parent)
+_REFRESH_HISTORY_FILE = CONFIG_DIR / "refresh_history.jsonl"
+_BUY_HISTORY_FILE = CONFIG_DIR / "buy_history.jsonl"
+
+
+def _token_fingerprint(token: str | None) -> str | None:
+    tok = str(token or "").strip()
+    if not tok:
+        return None
+    return hashlib.sha256(tok.encode("utf-8")).hexdigest()[:12]
+
+
+def _append_refresh_history(entry: dict[str, Any]) -> None:
+    payload = dict(entry)
+    payload.setdefault("ts_utc", datetime.now(timezone.utc).isoformat())
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with _REFRESH_HISTORY_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+        fh.write("\n")
+
+
+def _read_refresh_history(limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    if not _REFRESH_HISTORY_FILE.is_file():
+        return []
+    lines = _REFRESH_HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    out: list[dict[str, Any]] = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        try:
+            row = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            out.append(row)
+    if len(out) > limit:
+        return out[-limit:]
+    return out
+
+
+def _append_buy_history(entry: dict[str, Any]) -> None:
+    payload = dict(entry)
+    payload.setdefault("ts_utc", datetime.now(timezone.utc).isoformat())
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with _BUY_HISTORY_FILE.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+        fh.write("\n")
+
+
+def _read_buy_history(limit: int) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    if not _BUY_HISTORY_FILE.is_file():
+        return []
+    lines = _BUY_HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    out: list[dict[str, Any]] = []
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+        try:
+            row = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(row, dict):
+            out.append(row)
+    if len(out) > limit:
+        return out[-limit:]
+    return out
+
+
+def cmd_history(args: argparse.Namespace) -> int:
+    from wsprobe import trade_service as ts
+
+    limit = max(1, int(args.limit))
+    rows = _read_buy_history(limit)
+    if args.json:
+        print(format_json({"path": str(_BUY_HISTORY_FILE), "entries": rows}))
+        return 0
+    print(f"buy history path: {_BUY_HISTORY_FILE}")
+    if not rows:
+        print("no buy history entries yet")
+        return 0
+    for row in rows:
+        ts_utc = str(row.get("ts_utc") or "unknown-time")
+        status = str(row.get("status") or "unknown")
+        symbol = str(row.get("symbol") or "—")
+        security_id = str(row.get("security_id") or "—")
+        account_id = str(row.get("account_id") or "—")
+        quantity = row.get("filled_quantity")
+        if quantity is None:
+            quantity = row.get("submitted_quantity")
+        avg_price = row.get("average_filled_price")
+        value = row.get("submitted_value")
+        parts = [
+            f"{ts_utc}",
+            f"status={status}",
+            f"symbol={symbol}",
+            f"security_id={security_id}",
+            f"account_id={account_id}",
+        ]
+        if quantity is not None:
+            parts.append(f"quantity={quantity}")
+        if avg_price is not None:
+            parts.append(f"avg_price={avg_price}")
+        if value is not None:
+            parts.append(f"value={value}")
+        print("  ".join(parts))
+        order_id = row.get("order_id")
+        external_id = row.get("external_id")
+        if order_id or external_id:
+            print(f"  order_id={order_id or '-'} external_id={external_id or '-'}")
+    return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    limit = max(1, int(args.limit))
+    rows = _read_refresh_history(limit)
+    if args.json:
+        print(format_json({"path": str(_REFRESH_HISTORY_FILE), "entries": rows}))
+        return 0
+    print(f"refresh log path: {_REFRESH_HISTORY_FILE}")
+    if not rows:
+        print("no refresh history entries yet")
+        return 0
+    for row in rows:
+        ts = str(row.get("ts_utc") or "unknown-time")
+        event = str(row.get("event") or "event")
+        cycle = row.get("cycle")
+        cycle_txt = f" cycle={cycle}" if cycle is not None else ""
+        action = row.get("action")
+        action_txt = f" action={action}" if action else ""
+        browser = row.get("browser")
+        browser_txt = f" browser={browser}" if browser else ""
+        cookie = row.get("cookie")
+        cookie_txt = f" cookie={cookie}" if cookie else ""
+        status = row.get("status")
+        status_txt = f" status={status}" if status else ""
+        print(f"{ts}  {event}{cycle_txt}{action_txt}{status_txt}{browser_txt}{cookie_txt}")
+        tb = row.get("token_before_fp")
+        ta = row.get("token_after_fp")
+        if tb or ta:
+            print(f"  token_before={tb or '-'} token_after={ta or '-'}")
+        eb = row.get("exp_before")
+        ea = row.get("exp_after")
+        rem = row.get("remaining_s")
+        if eb or ea or rem is not None:
+            print(f"  exp_before={eb or '-'} exp_after={ea or '-'} remaining_s={rem if rem is not None else '-'}")
+        msg = row.get("message")
+        if msg:
+            print(f"  note={msg}")
+    return 0
 
 
 def _cli_invocation_name() -> str:
@@ -105,7 +272,12 @@ def _graphql_query_with_auth_retry(
     if injected_token:
         token = str(injected_token)
     else:
-        token = ensure_fresh_access_token(bundle, persist_path=persist)
+        token = _ensure_token_with_browser_recover(
+            args,
+            bundle,
+            persist,
+            force_refresh=False,
+        )
     status, payload, raw = graphql_request(
         access_token=token,
         operation_name=operation_name,
@@ -114,7 +286,12 @@ def _graphql_query_with_auth_retry(
         oauth_bundle=bundle,
     )
     if status == 401:
-        refreshed = ensure_fresh_access_token(bundle, persist_path=persist, force_refresh=True)
+        refreshed = _ensure_token_with_browser_recover(
+            args,
+            bundle,
+            persist,
+            force_refresh=True,
+        )
         status, payload, raw = graphql_request(
             access_token=refreshed,
             operation_name=operation_name,
@@ -125,17 +302,450 @@ def _graphql_query_with_auth_retry(
     return status, payload, raw
 
 
+def _ensure_token_with_browser_recover(
+    args: argparse.Namespace,
+    bundle: dict[str, Any],
+    persist: Path | None,
+    *,
+    force_refresh: bool,
+) -> str:
+    try:
+        return ensure_fresh_access_token(
+            bundle,
+            persist_path=persist,
+            force_refresh=force_refresh,
+        )
+    except SystemExit:
+        if persist is None:
+            raise
+        token_before = str(bundle.get("access_token") or "").strip()
+        recovered, browser_name = oauth2_bundle_first_available()
+        recovered_access = str(recovered.get("access_token") or "").strip()
+        recovered_exp = jwt_exp_unix(recovered_access) if recovered_access else None
+        if recovered_exp is not None and recovered_exp <= int(time.time()):
+            raise SystemExit(
+                f"Recovered browser credentials from {browser_name}, but access_token is already expired. "
+                "Re-login at https://my.wealthsimple.com and retry."
+            ) from None
+        _persist_bundle(persist, recovered)
+        _append_refresh_history(
+            {
+                "event": "browser_recover",
+                "status": "ok",
+                "browser": browser_name,
+                "cookie": "_oauth2_access_v2",
+                "persist_path": str(persist),
+                "token_before_fp": _token_fingerprint(token_before),
+                "token_after_fp": _token_fingerprint(recovered_access),
+                "exp_before": _format_expiry(jwt_exp_unix(token_before) if token_before else None),
+                "exp_after": _format_expiry(recovered_exp),
+            }
+        )
+        print(
+            f"Recovered credentials from browser={browser_name}; retrying auth.",
+            file=sys.stderr,
+        )
+        bundle2, persist2, _ = load_oauth_bundle(args)
+        return ensure_fresh_access_token(
+            bundle2,
+            persist_path=persist2,
+            force_refresh=force_refresh,
+        )
+
+
 def cmd_easy(args: argparse.Namespace) -> int:
     """Resolve saved/env credentials, then connectivity check."""
     bundle, persist, _src = load_oauth_bundle(args)
-    token = ensure_fresh_access_token(bundle, persist_path=persist)
+    token = _ensure_token_with_browser_recover(
+        args,
+        bundle,
+        persist,
+        force_refresh=False,
+    )
     return run_ping_with_token(token, args, oauth_bundle=bundle)
 
 
 def cmd_ping(args: argparse.Namespace) -> int:
     bundle, persist, _ = load_oauth_bundle(args)
-    token = ensure_fresh_access_token(bundle, persist_path=persist)
+    token = _ensure_token_with_browser_recover(
+        args,
+        bundle,
+        persist,
+        force_refresh=False,
+    )
     return run_ping_with_token(token, args, oauth_bundle=bundle)
+
+
+def _format_expiry(exp_unix: int | None) -> str:
+    if exp_unix is None:
+        return "unknown"
+    return datetime.fromtimestamp(exp_unix, tz=timezone.utc).isoformat()
+
+
+def _extract_activity_age_seconds(session_payload: dict[str, Any]) -> float | None:
+    if not isinstance(session_payload, dict):
+        return None
+    raw_last = session_payload.get("wsstg::lastActivityTime")
+    if raw_last is None:
+        return None
+    try:
+        last = float(raw_last)
+    except (TypeError, ValueError):
+        return None
+    if last > 10_000_000_000:
+        last = last / 1000.0
+    return max(0.0, time.time() - last)
+
+
+def _extract_idle_timeout_seconds(session_payload: dict[str, Any]) -> float:
+    if not isinstance(session_payload, dict):
+        return 30.0 * 60.0
+    raw = session_payload.get("wsstg::sessionInactivityTimeoutMinutes")
+    try:
+        mins = float(raw)
+    except (TypeError, ValueError):
+        return 30.0 * 60.0
+    if mins <= 0:
+        return 30.0 * 60.0
+    return mins * 60.0
+
+
+def _merge_refreshed_bundle(bundle: dict[str, Any], refreshed: dict[str, Any]) -> dict[str, Any]:
+    out = dict(bundle)
+    out["access_token"] = str(refreshed.get("access_token") or "").strip()
+    if refreshed.get("refresh_token"):
+        out["refresh_token"] = str(refreshed["refresh_token"]).strip()
+    for key in ("expires_in", "scope", "token_type", "created_at"):
+        if refreshed.get(key) is not None:
+            out[key] = refreshed[key]
+    return out
+
+
+def cmd_keepalive(args: argparse.Namespace) -> int:
+    bundle, persist, source = load_oauth_bundle(args)
+    if persist is None:
+        raise SystemExit(
+            "keepalive requires a persisted credential source (session/config/token file).\n"
+            "Run `wsp onboard` or `wsp import-session` first."
+        )
+    active_probe_s = int(args.active_probe_seconds)
+    idle_probe_s = int(args.idle_probe_seconds)
+    prepare_probe_s = int(args.prepare_probe_seconds)
+    refresh_threshold_s = int(args.refresh_threshold_seconds)
+    critical_threshold_s = int(args.critical_threshold_seconds)
+    max_retries = int(args.retry_attempts)
+    degraded_threshold = int(args.degraded_auth_failures)
+
+    token_state: dict[str, Any] = {
+        "created_at": None,
+        "expires_in": None,
+        "last_info_check_at": None,
+        "last_refresh_attempt_at": None,
+        "consecutive_probe_failures": 0,
+        "consecutive_auth_failures": 0,
+    }
+    print(
+        f"keepalive started; source={source}; persist={persist}; "
+        f"active_probe={active_probe_s}s idle_probe={idle_probe_s}s "
+        f"refresh_threshold={refresh_threshold_s}s critical_threshold={critical_threshold_s}s "
+        f"browser_recover={'on' if args.browser_recover else 'off'}",
+        file=sys.stderr,
+    )
+
+    cycle = 0
+    was_idle = False
+    backoff_schedule = (2.0, 5.0, 15.0)
+    next_probe_s = active_probe_s
+    try:
+        while True:
+            cycle += 1
+            try:
+                bundle, persist, _ = load_oauth_bundle(args)
+                access = str(bundle.get("access_token") or "").strip()
+                if not access:
+                    raise SystemExit("No access_token available in persisted credentials")
+                fp_before = _token_fingerprint(access)
+                probe_attempt = 0
+                token_info: dict[str, Any] | None = None
+                session_info: dict[str, Any] = {}
+                auth_probe_failed = False
+                token_info_blocked = False
+                while True:
+                    try:
+                        token_info = get_token_info(access)
+                        session_info = get_session_info(access)
+                        token_state["consecutive_probe_failures"] = 0
+                        break
+                    except AuthRequestError as e:
+                        is_auth = e.status in (401, 403)
+                        if e.status == 403:
+                            token_info_blocked = True
+                            break
+                        if is_auth:
+                            token_state["consecutive_auth_failures"] = int(token_state["consecutive_auth_failures"]) + 1
+                            auth_probe_failed = True
+                            break
+                        else:
+                            token_state["consecutive_probe_failures"] = int(token_state["consecutive_probe_failures"]) + 1
+                        if probe_attempt >= max_retries:
+                            raise SystemExit(str(e)) from e
+                        delay = jitter_delay(backoff_schedule[min(probe_attempt, len(backoff_schedule) - 1)])
+                        probe_attempt += 1
+                        _append_refresh_history(
+                            {
+                                "event": "auth_probe_retry",
+                                "cycle": cycle,
+                                "status": "retrying",
+                                "retry_attempt": probe_attempt,
+                                "retry_delay_s": round(delay, 3),
+                                "auth_error": is_auth,
+                                "http_status": e.status,
+                            }
+                        )
+                        time.sleep(delay)
+
+                if auth_probe_failed:
+                    expires_in = 0
+                elif token_info_blocked:
+                    exp_unix = jwt_exp_unix(access)
+                    expires_in = max(0, (exp_unix - int(time.time()))) if exp_unix is not None else 0
+                    token_state["expires_in"] = expires_in
+                    token_state["created_at"] = None
+                else:
+                    assert token_info is not None
+                    token_state["last_info_check_at"] = int(time.time())
+                    token_state["created_at"] = token_info.get("created_at")
+                    token_state["expires_in"] = token_info.get("expires_in")
+                    expires_in = int(token_info.get("expires_in") or 0)
+
+                age_s = _extract_activity_age_seconds(session_info)
+                idle_timeout_s = _extract_idle_timeout_seconds(session_info)
+                is_idle = bool(age_s is not None and age_s >= idle_timeout_s)
+
+                should_refresh = expires_in <= refresh_threshold_s
+                force_priority = expires_in <= critical_threshold_s
+                if int(token_state["consecutive_auth_failures"]) >= degraded_threshold:
+                    should_refresh = True
+                    force_priority = True
+
+                refresh_verified = False
+                refresh_note = "probe_only"
+                session_recovered = False
+                if should_refresh:
+                    last_created_at = token_info.get("created_at") if token_info else token_state.get("created_at")
+                    last_expires_in = expires_in
+                    last_exp_unix = jwt_exp_unix(access)
+                    last_fp = _token_fingerprint(access)
+                    refresh_attempt = 0
+                    while refresh_attempt <= max_retries:
+                        token_state["last_refresh_attempt_at"] = int(time.time())
+                        try:
+                            refresh_client_id = str(
+                                bundle.get("client_id") or os.environ.get("WEALTHSIMPLE_OAUTH_CLIENT_ID") or ""
+                            ).strip()
+                            refreshed = refresh_access_token(
+                                str(bundle.get("refresh_token") or "").strip(),
+                                **({"client_id": refresh_client_id} if refresh_client_id else {}),
+                            )
+                            merged = _merge_refreshed_bundle(bundle, refreshed)
+                            _persist_bundle(persist, merged)
+                            access = str(merged.get("access_token") or "").strip()
+                            if token_info_blocked:
+                                verify_info = {}
+                                next_exp_unix = jwt_exp_unix(access)
+                                created_changed = _token_fingerprint(access) != last_fp
+                                expires_jump = (
+                                    next_exp_unix is not None
+                                    and last_exp_unix is not None
+                                    and next_exp_unix >= (last_exp_unix + 240)
+                                )
+                                token_state["expires_in"] = (
+                                    max(0, next_exp_unix - int(time.time())) if next_exp_unix is not None else None
+                                )
+                                token_state["created_at"] = None
+                            else:
+                                verify_info = get_token_info(access)
+                                created_changed = verify_info.get("created_at") != last_created_at
+                                expires_jump = int(verify_info.get("expires_in") or 0) >= (last_expires_in + 240)
+                            if created_changed or expires_jump:
+                                refresh_verified = True
+                                token_state["created_at"] = verify_info.get("created_at")
+                                if not token_info_blocked:
+                                    token_state["expires_in"] = verify_info.get("expires_in")
+                                token_state["consecutive_auth_failures"] = 0
+                                refresh_note = "verified_jwt" if token_info_blocked else "verified"
+                                break
+                            refresh_note = "not_rotated"
+                            raise AuthRequestError("refresh verification did not show rollover", transient=True)
+                        except (RuntimeError, AuthRequestError, ValueError) as e:
+                            if refresh_attempt >= max_retries:
+                                if args.browser_recover:
+                                    recovered, browser_name = oauth2_bundle_first_available()
+                                    recovered_access = str(recovered.get("access_token") or "").strip()
+                                    recovered_exp = jwt_exp_unix(recovered_access) if recovered_access else None
+                                    if recovered_exp is not None and recovered_exp <= int(time.time()):
+                                        raise SystemExit(
+                                            f"Recovered browser credentials from {browser_name}, but access_token is already expired. "
+                                            "Re-login at https://my.wealthsimple.com and retry."
+                                        ) from None
+                                    _persist_bundle(persist, recovered)
+                                    bundle = recovered
+                                    access = recovered_access
+                                    token_state["consecutive_auth_failures"] = 0
+                                    verify_attempt = 0
+                                    while True:
+                                        try:
+                                            if token_info_blocked:
+                                                recovered_exp_after = jwt_exp_unix(access)
+                                                if recovered_exp_after is not None and recovered_exp_after <= int(time.time()):
+                                                    raise SystemExit(
+                                                        "browser recovery produced expired token"
+                                                    )
+                                                token_state["created_at"] = None
+                                                token_state["expires_in"] = (
+                                                    max(0, recovered_exp_after - int(time.time()))
+                                                    if recovered_exp_after is not None
+                                                    else None
+                                                )
+                                            else:
+                                                verify_info = get_token_info(access)
+                                                session_info = get_session_info(access)
+                                                token_state["created_at"] = verify_info.get("created_at")
+                                                token_state["expires_in"] = verify_info.get("expires_in")
+                                                token_state["last_info_check_at"] = int(time.time())
+                                            refresh_verified = True
+                                            session_recovered = True
+                                            break
+                                        except AuthRequestError as ve:
+                                            if ve.status in (401, 403):
+                                                raise SystemExit(
+                                                    "browser recovery produced token that still fails auth probe"
+                                                ) from ve
+                                            if verify_attempt >= max_retries:
+                                                raise SystemExit(
+                                                    f"browser recovery probe failed after retries: {ve}"
+                                                ) from ve
+                                            vdelay = jitter_delay(
+                                                backoff_schedule[min(verify_attempt, len(backoff_schedule) - 1)]
+                                            )
+                                            verify_attempt += 1
+                                            _append_refresh_history(
+                                                {
+                                                    "event": "auth_probe_retry",
+                                                    "cycle": cycle,
+                                                    "status": "retrying",
+                                                    "retry_attempt": verify_attempt,
+                                                    "retry_delay_s": round(vdelay, 3),
+                                                    "auth_error": False,
+                                                    "http_status": ve.status,
+                                                    "reason": "post_browser_recover_verify",
+                                                }
+                                            )
+                                            time.sleep(vdelay)
+                                    _append_refresh_history(
+                                        {
+                                            "event": "browser_recover",
+                                            "cycle": cycle,
+                                            "status": "ok",
+                                            "browser": browser_name,
+                                            "cookie": "_oauth2_access_v2",
+                                            "persist_path": str(persist),
+                                            "token_before_fp": fp_before,
+                                            "token_after_fp": _token_fingerprint(recovered_access),
+                                            "exp_after": _format_expiry(recovered_exp),
+                                        }
+                                    )
+                                    refresh_note = "browser_recovered_verified"
+                                    break
+                                raise SystemExit(f"refresh failed after retries: {e}") from e
+                            delay = jitter_delay(backoff_schedule[min(refresh_attempt, len(backoff_schedule) - 1)])
+                            refresh_attempt += 1
+                            _append_refresh_history(
+                                {
+                                    "event": "auth_refresh_retry",
+                                    "cycle": cycle,
+                                    "status": "retrying",
+                                    "retry_attempt": refresh_attempt,
+                                    "retry_delay_s": round(delay, 3),
+                                    "critical": force_priority,
+                                    "reason": str(e),
+                                }
+                            )
+                            time.sleep(delay)
+
+                action = "refresh" if should_refresh else "probe"
+                now_idle_to_active = was_idle and not is_idle
+                was_idle = is_idle
+                cadence_s = idle_probe_s if is_idle else active_probe_s
+                if not is_idle and refresh_threshold_s < expires_in <= 900:
+                    cadence_s = min(cadence_s, prepare_probe_s)
+                if now_idle_to_active:
+                    cadence_s = 0
+                next_probe_s = cadence_s
+                if action == "refresh" and not refresh_verified and not session_recovered:
+                    raise SystemExit("refresh path did not produce verified token state")
+
+                _append_refresh_history(
+                    {
+                        "event": "auth_keeper_cycle",
+                        "cycle": cycle,
+                        "action": action,
+                        "status": "ok",
+                        "source": source,
+                        "persist_path": str(persist),
+                        "token_before_fp": fp_before,
+                        "token_after_fp": _token_fingerprint(access),
+                        "expires_in": token_state.get("expires_in"),
+                        "created_at": token_state.get("created_at"),
+                        "activity_age_s": round(age_s, 2) if age_s is not None else None,
+                        "idle_timeout_s": round(idle_timeout_s, 2),
+                        "idle_mode": is_idle,
+                        "refresh_verified": refresh_verified,
+                        "refresh_note": refresh_note,
+                        "next_probe_s": cadence_s,
+                        "probe_failures": token_state.get("consecutive_probe_failures"),
+                        "auth_failures": token_state.get("consecutive_auth_failures"),
+                    }
+                )
+                print(
+                    f"[{cycle}] action={action} expires_in={token_state.get('expires_in')} "
+                    f"idle={is_idle} refresh_verified={refresh_verified} next_probe_s={cadence_s}",
+                    file=sys.stderr,
+                )
+            except SystemExit as e:
+                msg = str(e).strip() or "keepalive cycle failed"
+                _append_refresh_history(
+                    {
+                        "event": "auth_keeper_cycle",
+                        "cycle": cycle,
+                        "status": "error",
+                        "message": msg,
+                        "probe_failures": token_state.get("consecutive_probe_failures"),
+                        "auth_failures": token_state.get("consecutive_auth_failures"),
+                        "degraded": int(token_state.get("consecutive_auth_failures") or 0) >= degraded_threshold,
+                    }
+                )
+                print(f"[{cycle}] warning: {msg}", file=sys.stderr)
+                if args.once:
+                    return 1
+
+            if args.once:
+                return 0
+
+            sleep_s = next_probe_s
+            if token_state.get("expires_in") is not None:
+                try:
+                    rem = int(token_state["expires_in"])
+                except (TypeError, ValueError):
+                    rem = next_probe_s
+                if rem <= critical_threshold_s:
+                    sleep_s = int(min(45, critical_threshold_s))
+                elif rem <= refresh_threshold_s:
+                    sleep_s = int(min(60, prepare_probe_s))
+            time.sleep(sleep_s)
+    except KeyboardInterrupt:
+        print("keepalive stopped by user", file=sys.stderr)
+        return 130
 
 
 def cmd_security(args: argparse.Namespace) -> int:
@@ -183,11 +793,40 @@ def cmd_restrictions(args: argparse.Namespace) -> int:
         print(raw, file=sys.stderr)
         return 1
     assert payload is not None
+    err = payload.get("errors") if isinstance(payload, dict) else None
+    restrictions_unprocessable = bool(
+        isinstance(err, list)
+        and any(
+            isinstance(e, dict)
+            and isinstance(e.get("extensions"), dict)
+            and e.get("extensions", {}).get("code") == "UNPROCESSABLE_ENTITY"
+            for e in err
+        )
+    )
     if args.json:
-        print(format_json({"http_status": status, "body": payload}))
+        shown_payload = payload
+        if restrictions_unprocessable and isinstance(payload, dict):
+            shown_payload = {
+                "data": (payload.get("data") if isinstance(payload.get("data"), dict) else {}),
+                "errors": [],
+            }
+        out: dict[str, Any] = {"http_status": status, "body": shown_payload}
+        if restrictions_unprocessable:
+            out["note"] = "restrictions endpoint returned UNPROCESSABLE_ENTITY; treating as no restriction data"
+        print(format_json(out))
     else:
         print(f"HTTP {status}")
-        _print_result(payload, as_json=False)
+        if restrictions_unprocessable:
+            print("note: restrictions endpoint returned UNPROCESSABLE_ENTITY; no restriction data")
+            shown_payload = {
+                "data": (payload.get("data") if isinstance(payload.get("data"), dict) else {}),
+                "errors": [],
+            }
+            _print_result(shown_payload, as_json=False)
+        else:
+            _print_result(payload, as_json=False)
+    if restrictions_unprocessable:
+        return 0
     return 0 if status == 200 and not payload.get("errors") else 1
 
 
@@ -230,6 +869,21 @@ def _bundle_from_pasted_text(raw: str) -> dict[str, Any]:
                 return data
 
     raise SystemExit("Could not parse credentials JSON. Paste the console output JSON object.")
+
+
+def _reject_expired_imported_access_token(bundle: dict[str, Any]) -> None:
+    tok = str(bundle.get("access_token") or "").strip()
+    if not tok:
+        raise SystemExit("No access_token in imported credentials.")
+    exp = jwt_exp_unix(tok)
+    if exp is None:
+        return
+    now = int(time.time())
+    if exp <= now:
+        raise SystemExit(
+            "Imported access_token is already expired. "
+            "Re-copy _oauth2_access_v2 from a currently logged-in my.wealthsimple.com tab."
+        )
 
 
 def _normalize_security_id(raw: str) -> str:
@@ -315,8 +969,11 @@ def cmd_import_session(args: argparse.Namespace) -> int:
     if not raw.strip():
         raise SystemExit("No JSON input (give a file path or pipe JSON on stdin)")
     data = _bundle_from_pasted_text(raw)
+    _reject_expired_imported_access_token(data)
     _persist_bundle(SESSION_FILE, data)
     print(f"Saved credentials to {SESSION_FILE}", file=sys.stderr)
+    if getattr(args, "auto_keepalive", True):
+        _start_keepalive_background()
     return 0
 
 
@@ -525,12 +1182,26 @@ def _list_trade_accounts_with_refresh(args: argparse.Namespace) -> list[dict[str
 
     bundle, persist, _ = load_oauth_bundle(args)
     injected = getattr(args, "access_token", None)
-    token = str(injected) if injected else ensure_fresh_access_token(bundle, persist_path=persist)
+    token = (
+        str(injected)
+        if injected
+        else _ensure_token_with_browser_recover(
+            args,
+            bundle,
+            persist,
+            force_refresh=False,
+        )
+    )
     try:
         return ts.list_accounts(token, oauth_bundle=bundle)
     except RuntimeError as e:
         if ("401" in str(e) or "HTTP 401" in str(e)) and bundle.get("refresh_token") and not injected:
-            token2 = ensure_fresh_access_token(bundle, persist_path=persist, force_refresh=True)
+            token2 = _ensure_token_with_browser_recover(
+                args,
+                bundle,
+                persist,
+                force_refresh=True,
+            )
             return ts.list_accounts(token2, oauth_bundle=bundle)
         raise
 
@@ -553,7 +1224,7 @@ def cmd_accounts(args: argparse.Namespace) -> int:
         print("No Trade accounts returned.", file=sys.stderr)
         return 1
 
-    print("Wealthsimple Trade accounts (GraphQL). Ids work with buy / positions (Trade REST).", file=sys.stderr)
+    print("Wealthsimple Trade accounts (GraphQL). Ids work with buy / positions.", file=sys.stderr)
     print()
     for i, r in enumerate(rows, start=1):
         aid = r.get("id") or "—"
@@ -588,7 +1259,7 @@ def cmd_positions(args: argparse.Namespace) -> int:
             account_index=getattr(args, "account_index", None),
             oauth_bundle=bundle,
         )
-        pos = ts.list_positions(token, aid)
+        pos = ts.list_positions(token, aid, oauth_bundle=bundle)
         return aid, pos, accts
 
     try:
@@ -647,7 +1318,7 @@ def cmd_portfolio(args: argparse.Namespace) -> int:
             if not aid:
                 continue
             try:
-                pos = ts.list_positions(token, aid)
+                pos = ts.list_positions(token, aid, oauth_bundle=bundle)
             except RuntimeError:
                 pos = []
             blocks.append({"account": acc, "positions": pos})
@@ -712,6 +1383,10 @@ def cmd_buy(args: argparse.Namespace) -> int:
         raise SystemExit("Use exactly one of: positional query, --symbol, or --security-id.")
     if not has_target and not has_sym and not has_sec:
         raise SystemExit("Provide a positional ticker/query, --symbol TICKER, or --security-id sec-s-…")
+    has_shares = getattr(args, "shares", None) is not None
+    has_dollars = getattr(args, "dollars", None) is not None
+    if has_shares == has_dollars:
+        raise SystemExit("Provide exactly one of --shares N or --dollars USD.")
 
     if not args.confirm:
         print(
@@ -724,11 +1399,14 @@ def cmd_buy(args: argparse.Namespace) -> int:
             "Choose the account (TFSA is common for long-term investing; not tax advice):\n"
             "  wsprobe accounts\n"
             "  wsprobe buy VFV.TO --shares 1 --account-type tfsa --account-index 1 --confirm\n"
+            "  wsprobe buy VFV.TO --dollars 100 --account-type tfsa --account-index 1 --confirm\n"
             "  wsprobe buy --security-id sec-s-… --shares 1 --account-id <id-from-accounts> --confirm\n",
             file=sys.stderr,
         )
         print("Preflight only (no order):  wsprobe preview-buy …", file=sys.stderr)
         return 1
+
+    history_context: dict[str, Any] = {}
 
     def submit(token: str) -> dict[str, Any]:
         bundle, _, _ = load_oauth_bundle(args)
@@ -746,11 +1424,30 @@ def cmd_buy(args: argparse.Namespace) -> int:
             security_id = ts.symbol_to_security_id(token, str(sym).strip())
         else:
             security_id = _normalize_security_id(str(sec_id).strip())
+        security_data = ts.get_security(token, security_id)
+        stock = security_data.get("stock") if isinstance(security_data.get("stock"), dict) else {}
+        symbol = stock.get("symbol") if isinstance(stock, dict) else None
+        shares = float(args.shares) if has_shares else None
+        dollars = float(args.dollars) if has_dollars else None
+        if shares is not None and shares <= 0:
+            raise SystemExit("--shares must be positive")
+        if dollars is not None and dollars <= 0:
+            raise SystemExit("--dollars must be positive")
+        history_context.update(
+            {
+                "account_id": account_id,
+                "security_id": security_id,
+                "symbol": symbol,
+                "requested_shares": shares,
+                "requested_value": dollars,
+            }
+        )
         return ts.place_market_buy(
             token,
             account_id=account_id,
             security_id=security_id,
-            quantity=float(args.shares),
+            quantity=shares,
+            value=dollars,
         )
 
     try:
@@ -758,6 +1455,24 @@ def cmd_buy(args: argparse.Namespace) -> int:
     except Exception as e:
         print(str(e), file=sys.stderr)
         return 1
+
+    _append_buy_history(
+        {
+            "command": "buy",
+            "status": out.get("status"),
+            "account_id": history_context.get("account_id"),
+            "security_id": history_context.get("security_id"),
+            "symbol": history_context.get("symbol"),
+            "requested_shares": history_context.get("requested_shares"),
+            "requested_value": history_context.get("requested_value"),
+            "submitted_quantity": out.get("submittedQuantity"),
+            "submitted_value": out.get("submittedNetValue"),
+            "filled_quantity": out.get("filledQuantity"),
+            "average_filled_price": out.get("averageFilledPrice"),
+            "order_id": out.get("orderId"),
+            "external_id": out.get("externalId"),
+        }
+    )
 
     if args.json:
         print(format_json({"ok": True, "order": out}))
@@ -996,7 +1711,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     acc = str(bundle.get("access_token") or "")
     report["access_token"] = _access_token_brief(acc)
 
-    token = ensure_fresh_access_token(bundle, persist_path=persist)
+    token = _ensure_token_with_browser_recover(
+        args,
+        bundle,
+        persist,
+        force_refresh=False,
+    )
     sub = identity_id_for_graphql(token, bundle)
     if not sub:
         report["ok"] = False
@@ -1018,7 +1738,12 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         oauth_bundle=bundle,
     )
     if st == 401 and bundle.get("refresh_token"):
-        token = ensure_fresh_access_token(bundle, persist_path=persist, force_refresh=True)
+        token = _ensure_token_with_browser_recover(
+            args,
+            bundle,
+            persist,
+            force_refresh=True,
+        )
         st, pl, raw = graphql_request(
             access_token=token,
             operation_name="FetchIdentityPackages",
@@ -1099,13 +1824,64 @@ def cmd_onboard(args: argparse.Namespace) -> int:
     )
     raw = sys.stdin.read()
     data = _bundle_from_pasted_text(raw)
+    _reject_expired_imported_access_token(data)
     _persist_bundle(SESSION_FILE, data)
     print(f"Saved credentials to {SESSION_FILE}", file=sys.stderr)
+    if getattr(args, "auto_keepalive", True):
+        _start_keepalive_background()
     return 0
+
+
+def _clear_saved_oauth_state() -> None:
+    pid_path = CONFIG_DIR / "keepalive.pid"
+    if pid_path.is_file():
+        try:
+            pid = int(pid_path.read_text(encoding="utf-8").strip())
+            os.kill(pid, 15)
+        except (ValueError, OSError):
+            pass
+        try:
+            pid_path.unlink()
+        except OSError:
+            pass
+
+    for p in (CONFIG_FILE, SESSION_FILE):
+        try:
+            if p.is_file():
+                p.unlink()
+        except OSError as e:
+            raise SystemExit(f"Could not remove existing credentials file {p}: {e}") from e
+
+
+def _start_keepalive_background() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = CONFIG_DIR / "keepalive.log"
+    pid_path = CONFIG_DIR / "keepalive.pid"
+    cmd = [
+        sys.executable,
+        "-m",
+        "wsprobe",
+        "keepalive",
+    ]
+    with log_path.open("a", encoding="utf-8") as fh:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=fh,
+            stderr=fh,
+            start_new_session=True,
+            env=os.environ.copy(),
+        )
+    pid_path.write_text(str(proc.pid), encoding="utf-8")
+    print(
+        f"Started keepalive in background (pid: {proc.pid}, log: {log_path})",
+        file=sys.stderr,
+    )
 
 
 def cmd_snippet(args: argparse.Namespace) -> int:
     """Alias for onboard: print snippet, then wait for pasted JSON and save."""
+    _clear_saved_oauth_state()
     return cmd_onboard(args)
 
 
@@ -1140,10 +1916,12 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
             "  %(prog)s positions --account-type tfsa   holdings in one account\n"
             "  %(prog)s preview-buy …       read-only buy checks (no order)\n"
             "  %(prog)s buy X --shares 1 --account-type tfsa --account-index 1 --confirm   real market buy\n"
+            "  %(prog)s buy X --dollars 100 --account-type tfsa --account-index 1 --confirm real market buy by amount\n"
             "  %(prog)s sell --symbol X --shares 1 --account-type tfsa --account-index 1 --confirm  real market sell\n"
             "  %(prog)s export-session-snippet     print JS: paste on my.wealthsimple.com → session.json\n"
             "  %(prog)s session-path               print where session.json lives (~/.config/wsprobe/)\n"
             "  %(prog)s import-session tokens.json   save tokens to session.json (or stdin)\n"
+            "  %(prog)s keepalive                 background-friendly token refresh loop\n"
             "  %(prog)s --access-token \"$JWT\" ping   use this JWT instead of browser/session file\n"
             "  export WEALTHSIMPLE_OAUTH_JSON='{\"access_token\":\"…\",\"refresh_token\":\"…\"}'   env bundle\n"
         ),
@@ -1194,11 +1972,23 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         "onboard",
         help="Guided setup: paste console snippet output and save credentials",
     )
+    sp.add_argument(
+        "--auto-keepalive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Start keepalive in background after saving credentials (default: on)",
+    )
     sp.set_defaults(func=cmd_onboard)
 
     sp = sub.add_parser(
         "snippet",
         help="Print snippet, then wait for pasted JSON and save credentials",
+    )
+    sp.add_argument(
+        "--auto-keepalive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Start keepalive in background after saving credentials (default: on)",
     )
     sp.set_defaults(func=cmd_snippet)
 
@@ -1207,6 +1997,98 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         help="Connectivity check (identity packages)",
     )
     sp.set_defaults(func=cmd_ping)
+
+    sp = sub.add_parser(
+        "keepalive",
+        help="Keep OAuth session fresh by refreshing before expiry",
+    )
+    sp.add_argument(
+        "--active-probe-seconds",
+        type=int,
+        default=75,
+        metavar="N",
+        help="Probe cadence while active (default: 75)",
+    )
+    sp.add_argument(
+        "--idle-probe-seconds",
+        type=int,
+        default=420,
+        metavar="N",
+        help="Probe cadence while idle (default: 420)",
+    )
+    sp.add_argument(
+        "--prepare-probe-seconds",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Probe cadence in prepare window (default: 50)",
+    )
+    sp.add_argument(
+        "--refresh-threshold-seconds",
+        type=int,
+        default=480,
+        metavar="N",
+        help="Trigger refresh when expires_in <= N (default: 480)",
+    )
+    sp.add_argument(
+        "--critical-threshold-seconds",
+        type=int,
+        default=180,
+        metavar="N",
+        help="High-priority retry mode when expires_in <= N (default: 180)",
+    )
+    sp.add_argument(
+        "--retry-attempts",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Retry attempts for probe/refresh transient failures (default: 3)",
+    )
+    sp.add_argument(
+        "--degraded-auth-failures",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Consecutive auth failures before degraded state (default: 2)",
+    )
+    sp.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one cycle then exit",
+    )
+    sp.add_argument(
+        "--browser-recover",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-recover tokens from logged-in browser on refresh failure (default: on)",
+    )
+    sp.set_defaults(func=cmd_keepalive)
+
+    sp = sub.add_parser(
+        "logs",
+        help="Show local keepalive/browser cookie refresh history (read-only)",
+    )
+    sp.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Show the last N history rows (default: 50)",
+    )
+    sp.set_defaults(func=cmd_logs)
+
+    sp = sub.add_parser(
+        "history",
+        help="Show local buy history (read-only)",
+    )
+    sp.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Show the last N buy history rows (default: 50)",
+    )
+    sp.set_defaults(func=cmd_history)
 
     sp = sub.add_parser(
         "lookup",
@@ -1368,9 +2250,16 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
     sp.add_argument(
         "--shares",
         type=float,
-        required=True,
+        default=None,
         metavar="N",
-        help="Share quantity (fractional if your account supports it)",
+        help="Share quantity (use instead of --dollars)",
+    )
+    sp.add_argument(
+        "--dollars",
+        type=float,
+        default=None,
+        metavar="USD",
+        help="Dollar amount to buy (use instead of --shares)",
     )
     sp.add_argument(
         "--account-id",
@@ -1507,6 +2396,12 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         nargs="?",
         metavar="FILE",
         help="JSON file; omit to read JSON from stdin",
+    )
+    sp.add_argument(
+        "--auto-keepalive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Start keepalive in background after saving credentials (default: on)",
     )
     sp.set_defaults(func=cmd_import_session)
 
