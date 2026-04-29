@@ -78,14 +78,8 @@ def _auth_json_request(
 
 
 def _browser_like_refresh_headers(*, access_token: str | None = None) -> dict[str, str]:
-    try:
-        from wsprobe.browser_cookies import wealthsimple_request_context_first_available
-
-        ctx = wealthsimple_request_context_first_available()
-    except Exception:
-        ctx = {}
-    session_id = (ctx.get("ws_global_visitor_id") or "").strip() or str(uuid.uuid4())
-    device_id = (ctx.get("wssdi") or "").strip() or str(uuid.uuid4())
+    session_id = str(uuid.uuid4())
+    device_id = str(uuid.uuid4())
     app_instance = str(uuid.uuid4())
     headers = {
         "accept": "application/json",
@@ -115,9 +109,6 @@ def _browser_like_refresh_headers(*, access_token: str | None = None) -> dict[st
     }
     if access_token:
         headers["authorization"] = f"Bearer {access_token}"
-    cookie_header = (ctx.get("cookie_header") or "").strip()
-    if cookie_header:
-        headers["cookie"] = cookie_header
     return headers
 
 

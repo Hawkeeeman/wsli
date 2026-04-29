@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -13,7 +14,6 @@ from typing import Any, Callable
 from urllib.parse import unquote
 
 from wsprobe import __version__
-from wsprobe.browser_cookies import oauth2_bundle_first_available
 from wsprobe.client import (
     format_json,
     graphql_request,
@@ -180,13 +180,9 @@ def cmd_logs(args: argparse.Namespace) -> int:
         cycle_txt = f" cycle={cycle}" if cycle is not None else ""
         action = row.get("action")
         action_txt = f" action={action}" if action else ""
-        browser = row.get("browser")
-        browser_txt = f" browser={browser}" if browser else ""
-        cookie = row.get("cookie")
-        cookie_txt = f" cookie={cookie}" if cookie else ""
         status = row.get("status")
         status_txt = f" status={status}" if status else ""
-        print(f"{ts}  {event}{cycle_txt}{action_txt}{status_txt}{browser_txt}{cookie_txt}")
+        print(f"{ts}  {event}{cycle_txt}{action_txt}{status_txt}")
         tb = row.get("token_before_fp")
         ta = row.get("token_after_fp")
         if tb or ta:
@@ -272,8 +268,7 @@ def _graphql_query_with_auth_retry(
     if injected_token:
         token = str(injected_token)
     else:
-        token = _ensure_token_with_browser_recover(
-            args,
+        token = _ensure_token(
             bundle,
             persist,
             force_refresh=False,
@@ -286,8 +281,7 @@ def _graphql_query_with_auth_retry(
         oauth_bundle=bundle,
     )
     if status == 401:
-        refreshed = _ensure_token_with_browser_recover(
-            args,
+        refreshed = _ensure_token(
             bundle,
             persist,
             force_refresh=True,
@@ -302,62 +296,23 @@ def _graphql_query_with_auth_retry(
     return status, payload, raw
 
 
-def _ensure_token_with_browser_recover(
-    args: argparse.Namespace,
+def _ensure_token(
     bundle: dict[str, Any],
     persist: Path | None,
     *,
     force_refresh: bool,
 ) -> str:
-    try:
-        return ensure_fresh_access_token(
-            bundle,
-            persist_path=persist,
-            force_refresh=force_refresh,
-        )
-    except SystemExit:
-        if persist is None:
-            raise
-        token_before = str(bundle.get("access_token") or "").strip()
-        recovered, browser_name = oauth2_bundle_first_available()
-        recovered_access = str(recovered.get("access_token") or "").strip()
-        recovered_exp = jwt_exp_unix(recovered_access) if recovered_access else None
-        if recovered_exp is not None and recovered_exp <= int(time.time()):
-            raise SystemExit(
-                f"Recovered browser credentials from {browser_name}, but access_token is already expired. "
-                "Re-login at https://my.wealthsimple.com and retry."
-            ) from None
-        _persist_bundle(persist, recovered)
-        _append_refresh_history(
-            {
-                "event": "browser_recover",
-                "status": "ok",
-                "browser": browser_name,
-                "cookie": "_oauth2_access_v2",
-                "persist_path": str(persist),
-                "token_before_fp": _token_fingerprint(token_before),
-                "token_after_fp": _token_fingerprint(recovered_access),
-                "exp_before": _format_expiry(jwt_exp_unix(token_before) if token_before else None),
-                "exp_after": _format_expiry(recovered_exp),
-            }
-        )
-        print(
-            f"Recovered credentials from browser={browser_name}; retrying auth.",
-            file=sys.stderr,
-        )
-        bundle2, persist2, _ = load_oauth_bundle(args)
-        return ensure_fresh_access_token(
-            bundle2,
-            persist_path=persist2,
-            force_refresh=force_refresh,
-        )
+    return ensure_fresh_access_token(
+        bundle,
+        persist_path=persist,
+        force_refresh=force_refresh,
+    )
 
 
 def cmd_easy(args: argparse.Namespace) -> int:
     """Resolve saved/env credentials, then connectivity check."""
     bundle, persist, _src = load_oauth_bundle(args)
-    token = _ensure_token_with_browser_recover(
-        args,
+    token = _ensure_token(
         bundle,
         persist,
         force_refresh=False,
@@ -367,8 +322,7 @@ def cmd_easy(args: argparse.Namespace) -> int:
 
 def cmd_ping(args: argparse.Namespace) -> int:
     bundle, persist, _ = load_oauth_bundle(args)
-    token = _ensure_token_with_browser_recover(
-        args,
+    token = _ensure_token(
         bundle,
         persist,
         force_refresh=False,
@@ -421,32 +375,6 @@ def _merge_refreshed_bundle(bundle: dict[str, Any], refreshed: dict[str, Any]) -
     return out
 
 
-def _recover_browser_bundle_with_rotation(
-    *,
-    token_before_fp: str | None,
-    wait_seconds: int,
-    poll_seconds: float,
-) -> tuple[dict[str, Any], str, bool]:
-    wait_s = max(0, int(wait_seconds))
-    poll_s = max(0.5, float(poll_seconds))
-    deadline = time.monotonic() + float(wait_s)
-    last_bundle: dict[str, Any] | None = None
-    last_browser = ""
-    while True:
-        recovered, browser_name = oauth2_bundle_first_available()
-        recovered_access = str(recovered.get("access_token") or "").strip()
-        recovered_fp = _token_fingerprint(recovered_access)
-        rotated = bool(token_before_fp and recovered_fp and recovered_fp != token_before_fp)
-        last_bundle = recovered
-        last_browser = browser_name
-        if rotated or wait_s == 0:
-            return recovered, browser_name, rotated
-        if time.monotonic() >= deadline:
-            assert last_bundle is not None
-            return last_bundle, last_browser, False
-        time.sleep(poll_s)
-
-
 def cmd_keepalive(args: argparse.Namespace) -> int:
     bundle, persist, source = load_oauth_bundle(args)
     if persist is None:
@@ -461,10 +389,6 @@ def cmd_keepalive(args: argparse.Namespace) -> int:
     critical_threshold_s = int(args.critical_threshold_seconds)
     max_retries = int(args.retry_attempts)
     degraded_threshold = int(args.degraded_auth_failures)
-    recover_wait_s = int(args.browser_recover_wait_seconds)
-    recover_poll_s = float(args.browser_recover_poll_seconds)
-    require_rotation = bool(args.browser_recover_require_rotation)
-
     token_state: dict[str, Any] = {
         "created_at": None,
         "expires_in": None,
@@ -476,9 +400,7 @@ def cmd_keepalive(args: argparse.Namespace) -> int:
     print(
         f"keepalive started; source={source}; persist={persist}; "
         f"active_probe={active_probe_s}s idle_probe={idle_probe_s}s "
-        f"refresh_threshold={refresh_threshold_s}s critical_threshold={critical_threshold_s}s "
-        f"browser_recover={'on' if args.browser_recover else 'off'} "
-        f"recover_wait={recover_wait_s}s require_rotation={'on' if require_rotation else 'off'}",
+        f"refresh_threshold={refresh_threshold_s}s critical_threshold={critical_threshold_s}s",
         file=sys.stderr,
     )
 
@@ -566,152 +488,65 @@ def cmd_keepalive(args: argparse.Namespace) -> int:
                     last_expires_in = expires_in
                     last_exp_unix = jwt_exp_unix(access)
                     last_fp = _token_fingerprint(access)
-                    if args.browser_recover:
-                        recovered, browser_name, rotated = _recover_browser_bundle_with_rotation(
-                            token_before_fp=fp_before,
-                            wait_seconds=recover_wait_s,
-                            poll_seconds=recover_poll_s,
-                        )
-                        recovered_access = str(recovered.get("access_token") or "").strip()
-                        recovered_exp = jwt_exp_unix(recovered_access) if recovered_access else None
-                        if recovered_exp is not None and recovered_exp <= int(time.time()):
-                            raise SystemExit(
-                                f"Recovered browser credentials from {browser_name}, but access_token is already expired. "
-                                "Re-login at https://my.wealthsimple.com and retry."
-                            ) from None
-                        _persist_bundle(persist, recovered)
-                        bundle = recovered
-                        access = recovered_access
-                        token_state["consecutive_auth_failures"] = 0
-                        verify_attempt = 0
-                        while True:
-                            try:
-                                if token_info_blocked:
-                                    recovered_exp_after = jwt_exp_unix(access)
-                                    if recovered_exp_after is not None and recovered_exp_after <= int(time.time()):
-                                        raise SystemExit("browser recovery produced expired token")
-                                    token_state["created_at"] = None
-                                    token_state["expires_in"] = (
-                                        max(0, recovered_exp_after - int(time.time()))
-                                        if recovered_exp_after is not None
-                                        else None
-                                    )
-                                else:
-                                    verify_info = get_token_info(access)
-                                    session_info = get_session_info(access)
-                                    token_state["created_at"] = verify_info.get("created_at")
-                                    token_state["expires_in"] = verify_info.get("expires_in")
-                                    token_state["last_info_check_at"] = int(time.time())
-                                refresh_verified = True
-                                session_recovered = True
-                                break
-                            except AuthRequestError as ve:
-                                if ve.status in (401, 403):
-                                    raise SystemExit(
-                                        "browser recovery produced token that still fails auth probe"
-                                    ) from ve
-                                if verify_attempt >= max_retries:
-                                    raise SystemExit(
-                                        f"browser recovery probe failed after retries: {ve}"
-                                    ) from ve
-                                vdelay = jitter_delay(
-                                    backoff_schedule[min(verify_attempt, len(backoff_schedule) - 1)]
-                                )
-                                verify_attempt += 1
-                                _append_refresh_history(
-                                    {
-                                        "event": "auth_probe_retry",
-                                        "cycle": cycle,
-                                        "status": "retrying",
-                                        "retry_attempt": verify_attempt,
-                                        "retry_delay_s": round(vdelay, 3),
-                                        "auth_error": False,
-                                        "http_status": ve.status,
-                                        "reason": "post_browser_recover_verify",
-                                    }
-                                )
-                                time.sleep(vdelay)
-                        _append_refresh_history(
-                            {
-                                "event": "browser_recover",
-                                "cycle": cycle,
-                                "status": "ok",
-                                "browser": browser_name,
-                                "cookie": "_oauth2_access_v2",
-                                "persist_path": str(persist),
-                                "token_before_fp": fp_before,
-                                "token_after_fp": _token_fingerprint(recovered_access),
-                                "exp_after": _format_expiry(recovered_exp),
-                                "token_rotated": rotated,
-                                "strategy": "browser_first",
-                            }
-                        )
-                        if require_rotation and not rotated:
-                            raise SystemExit(
-                                "browser recovery did not produce a rotated token within wait window"
+                    refresh_attempt = 0
+                    while refresh_attempt <= max_retries:
+                        token_state["last_refresh_attempt_at"] = int(time.time())
+                        try:
+                            refresh_client_id = str(
+                                bundle.get("client_id") or os.environ.get("WEALTHSIMPLE_OAUTH_CLIENT_ID") or ""
+                            ).strip()
+                            refreshed = refresh_access_token(
+                                str(bundle.get("refresh_token") or "").strip(),
+                                access_token=str(bundle.get("access_token") or "").strip(),
+                                **({"client_id": refresh_client_id} if refresh_client_id else {}),
                             )
-                        refresh_note = "browser_recovered_verified"
-
-                    if not refresh_verified:
-                        refresh_attempt = 0
-                        while refresh_attempt <= max_retries:
-                            token_state["last_refresh_attempt_at"] = int(time.time())
-                            try:
-                                refresh_client_id = str(
-                                    bundle.get("client_id") or os.environ.get("WEALTHSIMPLE_OAUTH_CLIENT_ID") or ""
-                                ).strip()
-                                refreshed = refresh_access_token(
-                                    str(bundle.get("refresh_token") or "").strip(),
-                                    access_token=str(bundle.get("access_token") or "").strip(),
-                                    **({"client_id": refresh_client_id} if refresh_client_id else {}),
+                            merged = _merge_refreshed_bundle(bundle, refreshed)
+                            _persist_bundle(persist, merged)
+                            access = str(merged.get("access_token") or "").strip()
+                            if token_info_blocked:
+                                verify_info = {}
+                                next_exp_unix = jwt_exp_unix(access)
+                                created_changed = _token_fingerprint(access) != last_fp
+                                expires_jump = (
+                                    next_exp_unix is not None
+                                    and last_exp_unix is not None
+                                    and next_exp_unix >= (last_exp_unix + 240)
                                 )
-                                merged = _merge_refreshed_bundle(bundle, refreshed)
-                                _persist_bundle(persist, merged)
-                                access = str(merged.get("access_token") or "").strip()
-                                if token_info_blocked:
-                                    verify_info = {}
-                                    next_exp_unix = jwt_exp_unix(access)
-                                    created_changed = _token_fingerprint(access) != last_fp
-                                    expires_jump = (
-                                        next_exp_unix is not None
-                                        and last_exp_unix is not None
-                                        and next_exp_unix >= (last_exp_unix + 240)
-                                    )
-                                    token_state["expires_in"] = (
-                                        max(0, next_exp_unix - int(time.time())) if next_exp_unix is not None else None
-                                    )
-                                    token_state["created_at"] = None
-                                else:
-                                    verify_info = get_token_info(access)
-                                    created_changed = verify_info.get("created_at") != last_created_at
-                                    expires_jump = int(verify_info.get("expires_in") or 0) >= (last_expires_in + 240)
-                                if created_changed or expires_jump:
-                                    refresh_verified = True
-                                    token_state["created_at"] = verify_info.get("created_at")
-                                    if not token_info_blocked:
-                                        token_state["expires_in"] = verify_info.get("expires_in")
-                                    token_state["consecutive_auth_failures"] = 0
-                                    refresh_note = "verified_jwt" if token_info_blocked else "verified"
-                                    break
-                                refresh_note = "not_rotated"
-                                raise AuthRequestError("refresh verification did not show rollover", transient=True)
-                            except (RuntimeError, AuthRequestError, ValueError) as e:
-                                if refresh_attempt >= max_retries:
-                                    raise SystemExit(f"refresh failed after retries: {e}") from e
-                                delay = jitter_delay(backoff_schedule[min(refresh_attempt, len(backoff_schedule) - 1)])
-                                refresh_attempt += 1
-                                _append_refresh_history(
-                                    {
-                                        "event": "auth_refresh_retry",
-                                        "cycle": cycle,
-                                        "status": "retrying",
-                                        "retry_attempt": refresh_attempt,
-                                        "retry_delay_s": round(delay, 3),
-                                        "critical": force_priority,
-                                        "reason": str(e),
-                                    }
+                                token_state["expires_in"] = (
+                                    max(0, next_exp_unix - int(time.time())) if next_exp_unix is not None else None
                                 )
-                                time.sleep(delay)
+                                token_state["created_at"] = None
+                            else:
+                                verify_info = get_token_info(access)
+                                created_changed = verify_info.get("created_at") != last_created_at
+                                expires_jump = int(verify_info.get("expires_in") or 0) >= (last_expires_in + 240)
+                            if created_changed or expires_jump:
+                                refresh_verified = True
+                                token_state["created_at"] = verify_info.get("created_at")
+                                if not token_info_blocked:
+                                    token_state["expires_in"] = verify_info.get("expires_in")
+                                token_state["consecutive_auth_failures"] = 0
+                                refresh_note = "verified_jwt" if token_info_blocked else "verified"
+                                break
+                            refresh_note = "not_rotated"
+                            raise AuthRequestError("refresh verification did not show rollover", transient=True)
+                        except (RuntimeError, AuthRequestError, ValueError) as e:
+                            if refresh_attempt >= max_retries:
+                                raise SystemExit(f"refresh failed after retries: {e}") from e
+                            delay = jitter_delay(backoff_schedule[min(refresh_attempt, len(backoff_schedule) - 1)])
+                            refresh_attempt += 1
+                            _append_refresh_history(
+                                {
+                                    "event": "auth_refresh_retry",
+                                    "cycle": cycle,
+                                    "status": "retrying",
+                                    "retry_attempt": refresh_attempt,
+                                    "retry_delay_s": round(delay, 3),
+                                    "critical": force_priority,
+                                    "reason": str(e),
+                                }
+                            )
+                            time.sleep(delay)
 
                 action = "refresh" if should_refresh else "probe"
                 now_idle_to_active = was_idle and not is_idle
@@ -722,7 +557,7 @@ def cmd_keepalive(args: argparse.Namespace) -> int:
                 if now_idle_to_active:
                     cadence_s = 0
                 next_probe_s = cadence_s
-                if action == "refresh" and not refresh_verified and not session_recovered:
+                if action == "refresh" and not refresh_verified:
                     raise SystemExit("refresh path did not produce verified token state")
 
                 _append_refresh_history(
@@ -1225,8 +1060,7 @@ def _list_trade_accounts_with_refresh(args: argparse.Namespace) -> list[dict[str
     token = (
         str(injected)
         if injected
-        else _ensure_token_with_browser_recover(
-            args,
+        else _ensure_token(
             bundle,
             persist,
             force_refresh=False,
@@ -1236,8 +1070,7 @@ def _list_trade_accounts_with_refresh(args: argparse.Namespace) -> list[dict[str
         return ts.list_accounts(token, oauth_bundle=bundle)
     except RuntimeError as e:
         if ("401" in str(e) or "HTTP 401" in str(e)) and bundle.get("refresh_token") and not injected:
-            token2 = _ensure_token_with_browser_recover(
-                args,
+            token2 = _ensure_token(
                 bundle,
                 persist,
                 force_refresh=True,
@@ -1751,8 +1584,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     acc = str(bundle.get("access_token") or "")
     report["access_token"] = _access_token_brief(acc)
 
-    token = _ensure_token_with_browser_recover(
-        args,
+    token = _ensure_token(
         bundle,
         persist,
         force_refresh=False,
@@ -1778,8 +1610,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         oauth_bundle=bundle,
     )
     if st == 401 and bundle.get("refresh_token"):
-        token = _ensure_token_with_browser_recover(
-            args,
+        token = _ensure_token(
             bundle,
             persist,
             force_refresh=True,
@@ -1862,12 +1693,10 @@ def cmd_onboard(args: argparse.Namespace) -> int:
         "\n\nStep 3: paste the console output JSON below, then press Enter:\n",
         file=sys.stderr,
     )
-    raw = ""
-    while not raw.strip():
-        try:
-            raw = input()
-        except EOFError as e:
-            raise SystemExit("No JSON received. Paste the console output JSON, then press Enter.") from e
+    try:
+        raw = _read_pasted_json_from_stdin()
+    except KeyboardInterrupt as e:
+        raise SystemExit("Cancelled.") from e
     data = _bundle_from_pasted_text(raw)
     _reject_expired_imported_access_token(data)
     _persist_bundle(SESSION_FILE, data)
@@ -1896,6 +1725,38 @@ def _clear_saved_oauth_state() -> None:
                 p.unlink()
         except OSError as e:
             raise SystemExit(f"Could not remove existing credentials file {p}: {e}") from e
+
+
+def _read_pasted_json_from_stdin() -> str:
+    ansi_escape = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+    buf: list[str] = []
+    decoder = json.JSONDecoder()
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        line = ansi_escape.sub("", line).replace("\r", "")
+        if not buf and not line.strip():
+            continue
+        buf.append(line)
+        candidate = "\n".join(buf).strip()
+        if not candidate:
+            continue
+        try:
+            start = candidate.find("{")
+            if start < 0:
+                continue
+            parsed, end = decoder.raw_decode(candidate[start:])
+            if candidate[start + end :].strip():
+                continue
+            return json.dumps(parsed)
+        except json.JSONDecodeError:
+            continue
+    raw = "\n".join(buf).strip()
+    if raw:
+        return raw
+    raise SystemExit("No JSON received. Paste the console output JSON object, then press Enter.")
 
 
 def _start_keepalive_background() -> None:
@@ -2097,41 +1958,15 @@ def build_parser(*, prog: str | None = None) -> argparse.ArgumentParser:
         help="Consecutive auth failures before degraded state (default: 2)",
     )
     sp.add_argument(
-        "--browser-recover-wait-seconds",
-        type=int,
-        default=20,
-        metavar="N",
-        help="Wait up to N seconds for browser cookie rotation during recovery (default: 20)",
-    )
-    sp.add_argument(
-        "--browser-recover-poll-seconds",
-        type=float,
-        default=2.0,
-        metavar="N",
-        help="Poll interval while waiting for browser cookie rotation (default: 2.0)",
-    )
-    sp.add_argument(
-        "--browser-recover-require-rotation",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Fail cycle if browser recovery does not rotate token within wait window (default: off)",
-    )
-    sp.add_argument(
         "--once",
         action="store_true",
         help="Run one cycle then exit",
-    )
-    sp.add_argument(
-        "--browser-recover",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Auto-recover tokens from logged-in browser on refresh failure (default: on)",
     )
     sp.set_defaults(func=cmd_keepalive)
 
     sp = sub.add_parser(
         "logs",
-        help="Show local keepalive/browser cookie refresh history (read-only)",
+        help="Show local keepalive refresh history (read-only)",
     )
     sp.add_argument(
         "--limit",
