@@ -1,0 +1,35 @@
+{
+  "name": "wsli",
+  "version": "1.0.0",
+  "description": "Wealthsimple Trade CLI - accounts, positions, orders, and management",
+  "main": "dist/index.js",
+  "bin": {
+    "wsli": "./bin/wsli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "watch": "tsc --watch"
+  },
+  "keywords": [
+    "wealthsimple",
+    "trade",
+    "cli",
+    "investment",
+    "trading"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "dist",
+    "bin"
+  ]
+}

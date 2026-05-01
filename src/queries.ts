@@ -1,6 +1,8 @@
-"""GraphQL documents for wsprobe."""
+/**
+ * GraphQL documents for wsli
+ */
 
-FETCH_IDENTITY_PACKAGES = """
+export const FETCH_IDENTITY_PACKAGES = `
 query FetchIdentityPackages($id: ID!) {
   identity(id: $id) {
     id
@@ -11,9 +13,9 @@ query FetchIdentityPackages($id: ID!) {
     __typename
   }
 }
-"""
+`;
 
-FETCH_TRADE_ACCOUNT_LIST = """
+export const FETCH_TRADE_ACCOUNT_LIST = `
 query FetchTradeAccountList($identityId: ID!, $pageSize: Int = 50, $cursor: String) {
   identity(id: $identityId) {
     id
@@ -72,9 +74,9 @@ query FetchTradeAccountList($identityId: ID!, $pageSize: Int = 50, $cursor: Stri
     __typename
   }
 }
-"""
+`;
 
-FETCH_SECURITY = """
+export const FETCH_SECURITY = `
 query FetchSecurity($securityId: ID!) {
   security(id: $securityId) {
     id
@@ -94,9 +96,9 @@ query FetchSecurity($securityId: ID!) {
     __typename
   }
 }
-"""
+`;
 
-FETCH_SECURITY_QUOTES = """
+export const FETCH_SECURITY_QUOTES = `
 query FetchIntraDayChartQuotes(
   $id: ID!
   $date: Date
@@ -123,18 +125,18 @@ query FetchIntraDayChartQuotes(
     __typename
   }
 }
-"""
+`;
 
-FETCH_SO_ORDERS_LIMIT_ORDER_RESTRICTIONS = """
+export const FETCH_SO_ORDERS_LIMIT_ORDER_RESTRICTIONS = `
 query FetchSoOrdersLimitOrderRestrictions($args: SoOrders_LimitOrderRestrictionsArgs!) {
   soOrdersLimitOrderRestrictions(args: $args) {
     limitPriceThresholds
     __typename
   }
 }
-"""
+`;
 
-FETCH_SECURITY_SEARCH = """
+export const FETCH_SECURITY_SEARCH = `
 query FetchSecuritySearchResult($query: String!) {
   securitySearch(input: {query: $query}) {
     results {
@@ -152,9 +154,9 @@ query FetchSecuritySearchResult($query: String!) {
     __typename
   }
 }
-"""
+`;
 
-MUTATION_SO_ORDERS_ORDER_CREATE = """
+export const MUTATION_SO_ORDERS_ORDER_CREATE = `
 mutation SoOrdersOrderCreate($input: SoOrders_CreateOrderInput!) {
   soOrdersCreateOrder(input: $input) {
     errors {
@@ -170,9 +172,9 @@ mutation SoOrdersOrderCreate($input: SoOrders_CreateOrderInput!) {
     __typename
   }
 }
-"""
+`;
 
-FETCH_SO_ORDERS_EXTENDED_ORDER = """
+export const FETCH_SO_ORDERS_EXTENDED_ORDER = `
 query FetchSoOrdersExtendedOrder($branchId: String!, $externalId: String!) {
   soOrdersExtendedOrder(branchId: $branchId, externalId: $externalId) {
     averageFilledPrice
@@ -206,4 +208,4 @@ query FetchSoOrdersExtendedOrder($branchId: String!, $externalId: String!) {
     __typename
   }
 }
-"""
+`;
