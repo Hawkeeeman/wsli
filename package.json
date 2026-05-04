@@ -1,6 +1,6 @@
 {
   "name": "wsli",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Wealthsimple CLI: GraphQL + Trade REST (accounts, portfolio, buy/sell)",
   "license": "MIT",
   "repository": {
@@ -9,15 +9,16 @@
   },
   "type": "module",
   "files": [
-    "dist"
+    "dist",
+    "wsli.mjs"
   ],
   "bin": {
-    "wsli": "./dist/index.js"
+    "wsli": "./wsli.mjs"
   },
   "scripts": {
     "prepare": "npm run build",
     "build": "tsc -p tsconfig.json",
-    "wsli": "node ./dist/index.js",
+    "wsli": "node ./wsli.mjs",
     "dev": "tsx src/index.ts",
     "check": "tsc --noEmit -p tsconfig.json"
   },

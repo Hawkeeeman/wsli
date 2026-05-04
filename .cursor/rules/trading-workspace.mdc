@@ -3,4 +3,4 @@ description: Trading repo — wsli, Wealthsimple read-only + trade flows
 alwaysApply: true
 ---
 
-Primary CLI is **`wsli`** (Node, repo root: `npm install && npm run build`, bin `wsli` → `dist/index.js` (from `src/index.ts`)). Read-only Wealthsimple GraphQL and Trade REST at `trade-service.wealthsimple.com` for accounts, portfolio, positions, funding; market buy/sell require `--confirm`. Session defaults to `~/.config/wsli/session.json`; legacy `~/.config/wsprobe/session.json` is used if the wsli file is absent. The repo may contain other bots, scripts, and sim code — prefer the smallest change that matches the user’s request.
+Primary CLI is **`wsli`** (Node, repo root: `npm install`; npm `bin` is `wsli.mjs`, which rebuilds when `src/` is newer than `dist/`, then runs `dist/index.js`). Read-only Wealthsimple GraphQL and Trade REST at `trade-service.wealthsimple.com` for accounts, portfolio, positions, funding; market buy/sell require `--confirm`. Session is stored at `~/.config/wsli/session.json`. The repo may contain other bots, scripts, and sim code — prefer the smallest change that matches the user’s request.

@@ -7,7 +7,7 @@ import process from "node:process";
 import crypto from "node:crypto";
 import readline from "node:readline";
 
-const VERSION = "0.2.0";
+const VERSION = "0.2.1";
 const GRAPHQL_URL = "https://my.wealthsimple.com/graphql";
 const TRADE_SERVICE_BASE = "https://trade-service.wealthsimple.com";
 const OAUTH_TOKEN_URL = "https://api.production.wealthsimple.com/v1/oauth/v2/token";
@@ -16,9 +16,6 @@ const DEFAULT_OAUTH_CLIENT_ID = "4da53ac2b03225bed1550eba8e4611e086c7b905a3855e6
 const CONFIG_DIR = path.join(os.homedir(), ".config", "wsli");
 const SESSION_FILE = path.join(CONFIG_DIR, "session.json");
 const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
-const LEGACY_CONFIG_DIR = path.join(os.homedir(), ".config", "wsprobe");
-const LEGACY_SESSION_FILE = path.join(LEGACY_CONFIG_DIR, "session.json");
-const LEGACY_CONFIG_FILE = path.join(LEGACY_CONFIG_DIR, "config.json");
 const LOG_FILE = path.join(CONFIG_DIR, "logs.jsonl");
 const BUY_HISTORY_FILE = path.join(CONFIG_DIR, "buy_history.jsonl");
 const DEFAULT_API_VERSION = "12";
@@ -432,22 +429,16 @@ async function resolveOAuthBundle(opts: GlobalOptions): Promise<OAuthBundle> {
   const sessionBundle = loadBundleFromPath(SESSION_FILE);
   if (sessionBundle) return sessionBundle;
 
-  const legacySession = loadBundleFromPath(LEGACY_SESSION_FILE);
-  if (legacySession) return legacySession;
-
-  const legacyConfig = loadBundleFromPath(LEGACY_CONFIG_FILE);
-  if (legacyConfig) return legacyConfig;
-
   throw new Error(
     "No credentials found. Run wsli setup or wsli import-session <tokens.json>, or set WEALTHSIMPLE_ACCESS_TOKEN. " +
-      `(New session file: ${SESSION_FILE}; legacy Python tool used ${LEGACY_SESSION_FILE}.)`
+      `(Session file: ${SESSION_FILE}.)`
   );
 }
 
 async function resolveAccessToken(opts: GlobalOptions): Promise<{ token: string; bundle: OAuthBundle }> {
   let bundle = await resolveOAuthBundle(opts);
   const noRefresh = ["1", "true", "yes"].includes(
-    String(process.env.WSPROBE_NO_REFRESH ?? process.env.WSLI_NO_REFRESH ?? "").trim().toLowerCase()
+    String(process.env.WSLI_NO_REFRESH ?? "").trim().toLowerCase()
   );
   if (!noRefresh && accessTokenNeedsRefresh(bundle.access_token) && bundle.refresh_token) {
     try {
@@ -804,8 +795,11 @@ async function main(): Promise<void> {
     const response = await fetch(OAUTH_TOKEN_INFO_URL, {
       headers: { accept: "application/json", authorization: `Bearer ${token}` }
     });
-    const payload = await response.json();
-    print({ status: response.status, payload }, !!opts.json);
+    await response.json().catch(() => ({}));
+    const exp = jwtExpUnix(token);
+    const lifetime = exp !== null ? Math.max(0, Math.floor(exp - Date.now() / 1000)) : null;
+    const out = { status: response.status, lifetime };
+    console.log(opts.json ? JSON.stringify(out, null, 2) : JSON.stringify(out));
     if (!response.ok) process.exit(1);
   });
 
@@ -817,7 +811,7 @@ async function main(): Promise<void> {
       const runCycle = async (): Promise<void> => {
         const bundle = await resolveOAuthBundle(opts);
         const noRefresh = ["1", "true", "yes"].includes(
-          String(process.env.WSPROBE_NO_REFRESH ?? process.env.WSLI_NO_REFRESH ?? "").trim().toLowerCase()
+          String(process.env.WSLI_NO_REFRESH ?? "").trim().toLowerCase()
         );
         let access = bundle.access_token;
         let tokenInfo: Record<string, unknown> = {};
@@ -828,7 +822,7 @@ async function main(): Promise<void> {
           });
           tokenInfo = (await response.json()) as Record<string, unknown>;
           if (response.status === 401 || response.status === 403) {
-            if (noRefresh) throw new Error("Token probe returned 401/403 and refresh is disabled (WSPROBE_NO_REFRESH).");
+            if (noRefresh) throw new Error("Token probe returned 401/403 and refresh is disabled (WSLI_NO_REFRESH).");
             if (!bundle.refresh_token) throw new Error("Token probe failed and no refresh_token available.");
             const refreshed = await refreshAccessToken(bundle);
             access = refreshed.access_token;

@@ -16,16 +16,15 @@ Clone (HTTPS or SSH), then from that directory:
 git clone https://github.com/Hawkeeeman/wsli.git
 cd wsli
 npm install
-npm run build
-node dist/index.js --help
+./wsli --help
 ```
 
-This repo includes an executable **`wsli`** launcher at the root (runs `node dist/index.js`). Add the **clone directory** to your `PATH` if you want the bare `wsli` command everywhere (then open a new shell or `source ~/.zshrc`).
+This repo includes a root **`wsli`** script (and **`wsli.mjs`**, the same logic) that rebuilds from `src/` when `dist/` is missing or stale, then runs the CLI. Add the **clone directory** to your `PATH` if you want the bare `wsli` command everywhere (then open a new shell or `source ~/.zshrc`).
 
 **`zsh: command not found: wsli`** — until the repo is on `PATH`, from this directory use any of:
 
 ```bash
-node dist/index.js ping --json
+./wsli ping --json
 npm run wsli -- ping --json
 npm exec wsli -- ping --json
 ```
@@ -36,11 +35,9 @@ To use the bare `wsli` command: `npm link` in the repo root, then put npm’s gl
 
 OAuth bundle is stored at **`~/.config/wsli/session.json`** (see `wsli session-path`).
 
-If you previously used the removed Python tool, **`~/.config/wsprobe/session.json`** is still read automatically when the wsli session file is missing.
-
 ## Commands
 
-Run `node dist/index.js --help` (or `npm run wsli -- --help`) and the same with `<command> --help`.
+Run `./wsli --help` (or `npm run wsli -- --help`) and the same with `<command> --help`.
 
 Core commands: `setup`, `onboard`, `snippet`, `config-path`, `session-path`, `import-session`, `ping`, `keepalive`, `lookup`, `security`, `restrictions`, `preview-buy`, `accounts`, `positions`, `portfolio`, `funding`, `buy`, `sell` (buy/sell require `--confirm`), `logs`, `history`.
 
@@ -48,7 +45,7 @@ Core commands: `setup`, `onboard`, `snippet`, `config-path`, `session-path`, `im
 
 - `--token-file`, `--access-token`, `--refresh-token`, `--json`
 - `WEALTHSIMPLE_ACCESS_TOKEN`, `WEALTHSIMPLE_REFRESH_TOKEN`, `WEALTHSIMPLE_OAUTH_JSON`, `WEALTHSIMPLE_OAUTH_CLIENT_ID`
-- `WSLI_NO_REFRESH` or `WSPROBE_NO_REFRESH`: set to `1` / `true` to skip OAuth refresh
+- `WSLI_NO_REFRESH`: set to `1` / `true` to skip OAuth refresh
 
 ## Develop
 
