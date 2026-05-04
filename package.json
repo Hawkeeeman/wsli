@@ -3,6 +3,10 @@
   "version": "0.2.0",
   "description": "Wealthsimple CLI: GraphQL + Trade REST (accounts, portfolio, buy/sell)",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Hawkeeeman/wsli.git"
+  },
   "type": "module",
   "files": [
     "dist"

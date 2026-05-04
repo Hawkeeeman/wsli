@@ -1,5 +1,7 @@
 # wsli
 
+Source: [github.com/Hawkeeeman/wsli](https://github.com/Hawkeeeman/wsli).
+
 Wealthsimple CLI (Node.js): read-only GraphQL, Trade REST for accounts / positions / portfolio / funding, read-only `preview-buy`, and real market **buy** / **sell** with `--confirm`.
 
 ## Requirements
@@ -8,15 +10,17 @@ Wealthsimple CLI (Node.js): read-only GraphQL, Trade REST for accounts / positio
 
 ## Install
 
-From a clone of this repo:
+Clone (HTTPS or SSH), then from that directory:
 
 ```bash
+git clone https://github.com/Hawkeeeman/wsli.git
+cd wsli
 npm install
 npm run build
 node dist/index.js --help
 ```
 
-This repo includes an executable **`wsli`** launcher at the root (runs `node dist/index.js`). If `~/work/wsprobe` is on your `PATH`, the bare command `wsli` works after a new shell (or `source ~/.zshrc`).
+This repo includes an executable **`wsli`** launcher at the root (runs `node dist/index.js`). Add the **clone directory** to your `PATH` if you want the bare `wsli` command everywhere (then open a new shell or `source ~/.zshrc`).
 
 **`zsh: command not found: wsli`** — until the repo is on `PATH`, from this directory use any of:
 
