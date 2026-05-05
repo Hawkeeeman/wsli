@@ -601,6 +601,19 @@ async function graphqlRequest(
   bundle?: OAuthBundle
 ): Promise<Record<string, unknown>> {
   const identityId = identityIdFromToken(token) ?? (bundle?.identity_canonical_id as string | undefined);
+  const varsObj = variables as Record<string, unknown>;
+  const argsObj = (varsObj.args as Record<string, unknown> | undefined) ?? {};
+  const inputObj = (varsObj.input as Record<string, unknown> | undefined) ?? {};
+  const securityIdCandidate =
+    (typeof varsObj.securityId === "string" && varsObj.securityId) ||
+    (typeof varsObj.id === "string" && String(varsObj.id).startsWith("sec-s-") ? (varsObj.id as string) : "") ||
+    (typeof argsObj.securityId === "string" && argsObj.securityId) ||
+    (typeof inputObj.securityId === "string" && inputObj.securityId) ||
+    "";
+  const refererPath = securityIdCandidate
+    ? `https://my.wealthsimple.com/app/security-details/${securityIdCandidate}`
+    : "https://my.wealthsimple.com/";
+  const pageName = securityIdCandidate ? "page-security-details" : "page-home";
   const response = await fetch(GRAPHQL_URL, {
     method: "POST",
     headers: {
@@ -608,12 +621,19 @@ async function graphqlRequest(
       "content-type": "application/json",
       authorization: `Bearer ${token}`,
       origin: "https://my.wealthsimple.com",
-      referer: "https://my.wealthsimple.com/",
-      "user-agent": "wsli",
+      referer: refererPath,
+      "user-agent":
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
       "x-ws-api-version": DEFAULT_API_VERSION,
       "x-ws-profile": "trade",
+      "x-ws-locale": "en-CA",
+      "x-ws-client-tier": "core",
+      "x-platform-os": "web",
+      "x-ws-request-timeout": "4000",
+      "x-ws-device-id": "182f4094-2830-4847-bede-e73731e65c8a",
       "x-ws-operation-name": operationName,
       "x-ws-client-library": "wsli",
+      "x-ws-page": pageName,
       ...(identityId ? { "x-ws-identity-id": identityId } : {})
     },
     body: JSON.stringify({ operationName, query, variables })
@@ -912,7 +932,7 @@ async function assertDollarBuyEligibleSecurity(token: string, bundle: OAuthBundl
   }
 }
 
-function assertBuyOrderNotRejected(order: Record<string, unknown>): void {
+function assertOrderNotRejected(order: Record<string, unknown>): void {
   const status = String(order.status ?? "").toLowerCase();
   if (status !== "rejected") return;
   const code = String(order.rejectionCode ?? "").trim();
@@ -966,7 +986,12 @@ async function resolveAccountId(
   throw new Error("Multiple accounts found. Provide --account-id or --account-type.");
 }
 
-async function waitForOrderStatus(token: string, externalId: string, timeoutSeconds = 30): Promise<Record<string, unknown>> {
+async function waitForOrderStatus(
+  token: string,
+  externalId: string,
+  timeoutSeconds = 30,
+  acceptPending = false
+): Promise<Record<string, unknown>> {
   const deadline = Date.now() + timeoutSeconds * 1000;
   while (Date.now() < deadline) {
     let payload: Record<string, unknown>;
@@ -986,6 +1011,9 @@ async function waitForOrderStatus(token: string, externalId: string, timeoutSeco
     const order = (payload.data as Record<string, unknown>)?.soOrdersExtendedOrder as Record<string, unknown> | undefined;
     if (order) {
       const status = String(order.status ?? "").toLowerCase();
+      if (acceptPending && ["new", "pending", "queued", "accepted", "open", "submitted", "in_progress"].includes(status)) {
+        return order;
+      }
       if (!["", "new", "pending", "queued", "accepted", "open", "submitted", "in_progress"].includes(status)) {
         return order;
       }
@@ -993,6 +1021,107 @@ async function waitForOrderStatus(token: string, externalId: string, timeoutSeco
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }
   throw new Error(`Order ${externalId} did not finalize in ${timeoutSeconds}s`);
+}
+
+function numericQuantity(value: unknown): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+async function resolveSymbolFromSecurityId(token: string, bundle: OAuthBundle, securityId: string): Promise<string> {
+  const payload = await graphqlRequest(token, "FetchSecurity", FETCH_SECURITY, { securityId }, bundle);
+  const security = (payload.data as Record<string, unknown> | undefined)?.security as Record<string, unknown> | undefined;
+  const stock = security?.stock as Record<string, unknown> | undefined;
+  const symbol = String(stock?.symbol ?? "").trim().toUpperCase();
+  if (!symbol) throw new Error(`Could not resolve symbol for ${securityId}.`);
+  return symbol;
+}
+
+function fallbackQuantityFromHistory(accountId: string, securityId: string, symbol: string): number {
+  const rows = readJsonl(BUY_HISTORY_FILE, 2000);
+  let qty = 0;
+  for (const row of rows) {
+    const rowAccount = String(row.account_id ?? "").trim();
+    if (rowAccount !== accountId) continue;
+    const rowSecurity = String(row.security_id ?? "").trim();
+    const rowSymbol = String(row.symbol ?? "").trim().toUpperCase();
+    const status = String(row.status ?? "").trim().toLowerCase();
+    if (status !== "filled") continue;
+    if (rowSecurity !== securityId && rowSymbol !== symbol) continue;
+    const side = String(row.side ?? "").trim().toLowerCase();
+    const filledQty = numericQuantity(row.filled_quantity);
+    const submittedQty = numericQuantity(row.submitted_quantity);
+    const delta = filledQty > 0 ? filledQty : submittedQty;
+    if (delta <= 0) continue;
+    if (side === "buy") qty += delta;
+    if (side === "sell") qty -= delta;
+  }
+  return qty < 0 ? 0 : qty;
+}
+
+async function resolvePositionQuantity(
+  token: string,
+  bundle: OAuthBundle,
+  accountId: string,
+  securityId: string,
+  symbol: string
+): Promise<{ liveQuantity: number; fallbackQuantity: number; resolvedQuantity: number; source: "positions" | "history_fallback" }> {
+  const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
+  const positions = ((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ?? [];
+  const symbolUp = symbol.trim().toUpperCase();
+  const livePosition = (positions as Record<string, unknown>[]).find(
+    (row) => String(row.symbol ?? "").trim().toUpperCase() === symbolUp
+  );
+  const liveQuantity = livePosition ? numericQuantity((livePosition as Record<string, unknown>).quantity) : 0;
+  const fallbackQuantity = fallbackQuantityFromHistory(accountId, securityId, symbolUp);
+  if (liveQuantity > 0) {
+    return { liveQuantity, fallbackQuantity, resolvedQuantity: liveQuantity, source: "positions" };
+  }
+  return { liveQuantity, fallbackQuantity, resolvedQuantity: fallbackQuantity, source: "history_fallback" };
+}
+
+async function submitAndWaitOrder(
+  token: string,
+  bundle: OAuthBundle,
+  input: Record<string, unknown>,
+  logEvent: "buy_submit_attempt" | "sell_submit_attempt",
+  logMeta: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  appendLog({
+    event: logEvent,
+    status: "start",
+    ...logMeta
+  });
+  const createPayload = await graphqlRequest(token, "SoOrdersOrderCreate", MUTATION_SO_ORDERS_ORDER_CREATE, { input }, bundle);
+  const createData = (createPayload.data as Record<string, unknown> | undefined)?.soOrdersCreateOrder as
+    | Record<string, unknown>
+    | undefined;
+  const createErrors = Array.isArray(createData?.errors) ? (createData?.errors as unknown[]) : [];
+  if (createErrors.length > 0) {
+    const first = (createErrors[0] ?? {}) as Record<string, unknown>;
+    const code = String(first.code ?? "unknown");
+    const message = String(first.message ?? "Order create failed.");
+    appendLog({
+      event: logEvent,
+      status: "rejected",
+      rejection_code: code,
+      rejection_message: message,
+      ...logMeta
+    });
+    throw new Error(`Order create rejected (${code}): ${message}`);
+  }
+  const createdOrder = (createData?.order as Record<string, unknown> | undefined) ?? {};
+  appendLog({
+    event: logEvent,
+    status: "accepted",
+    order_id: String(createdOrder.orderId ?? ""),
+    created_at: createdOrder.createdAt ?? null,
+    ...logMeta
+  });
+  const externalId = String(input.externalId ?? "");
+  const order = await waitForOrderStatus(token, externalId);
+  assertOrderNotRejected(order);
+  return order;
 }
 
 function withGlobalOptions(command: Command): Command {
@@ -1276,14 +1405,20 @@ async function main(): Promise<void> {
           probe_failures: consecutiveProbeFailures,
           auth_failures: consecutiveAuthFailures
         });
-        print({
-          action,
-          token_info: tokenInfo ?? {},
-          session_info: sessionInfo ?? {},
-          expires_in: expiresIn,
-          idle_mode: isIdle,
-          next_probe_ms: cadenceMs
-        });
+        const refreshFlag = action === "refresh" ? (refreshVerified ? "yes" : "no") : "n/a";
+        const sessionFlag = sessionInfo === null ? "unavailable" : "ok";
+        const nextProbeSeconds = Math.floor(cadenceMs / 1000);
+        const parts = [
+          `action=${action}`,
+          `expires_in=${expiresIn}s`,
+          `refresh_verified=${refreshFlag}`,
+          `idle_mode=${isIdle ? "yes" : "no"}`,
+          `session_info=${sessionFlag}`,
+          `next_probe=${nextProbeSeconds}s`,
+          `probe_failures=${consecutiveProbeFailures}`,
+          `auth_failures=${consecutiveAuthFailures}`
+        ];
+        console.log(parts.join(" "));
       };
       if (cmdOpts.once) {
         await runCycle();
@@ -1366,8 +1501,9 @@ async function main(): Promise<void> {
     .argument("[securityOrQuery]", "Security id or ticker/query")
     .option("--symbol <ticker>", "Ticker/search text instead of positional arg")
     .requiredOption("--shares <n>", "Share quantity")
-    .option("--order <type>", "market or limit", "market")
+    .option("--order <type>", "market, limit, stop_limit, or stop_market", "market")
     .option("--limit-price <n>", "Required when --order limit")
+    .option("--stop-price <n>", "Required when --order stop_limit")
     .option("--assume-price <n>", "Informational notional estimate only")
     .action(async (securityOrQuery: string | undefined, cmdOpts: Record<string, string | undefined>) => {
       const opts = program.opts<GlobalOptions>();
@@ -1377,18 +1513,43 @@ async function main(): Promise<void> {
       if (!chosen) throw new Error("Provide security id/search query or --symbol.");
       const shares = Number.parseFloat(String(cmdOpts.shares ?? ""));
       if (!Number.isFinite(shares) || shares <= 0) throw new Error("--shares must be positive");
-      const order = String(cmdOpts.order ?? "market").toLowerCase();
+      const orderRaw = String(cmdOpts.order ?? "market").toLowerCase().replace("-", "_");
+      const order = orderRaw === "stoplimit" ? "stop_limit" : orderRaw;
       const limitPrice = cmdOpts.limitPrice !== undefined ? Number.parseFloat(String(cmdOpts.limitPrice)) : undefined;
+      const stopPrice = cmdOpts.stopPrice !== undefined ? Number.parseFloat(String(cmdOpts.stopPrice)) : undefined;
+      if (!["market", "limit", "stop_limit", "stop_market"].includes(order)) {
+        throw new Error("--order must be market, limit, stop_limit, or stop_market.");
+      }
       if (order === "limit" && (limitPrice === undefined || !Number.isFinite(limitPrice) || limitPrice <= 0)) {
         throw new Error("limit orders require positive --limit-price");
       }
+      if (order === "stop_limit") {
+        if (limitPrice === undefined || !Number.isFinite(limitPrice) || limitPrice <= 0) {
+          throw new Error("stop_limit orders require positive --limit-price");
+        }
+        if (stopPrice === undefined || !Number.isFinite(stopPrice) || stopPrice <= 0) {
+          throw new Error("stop_limit orders require positive --stop-price");
+        }
+      }
+      if (order === "stop_market") {
+        if (stopPrice === undefined || !Number.isFinite(stopPrice) || stopPrice <= 0) {
+          throw new Error("stop_market orders require positive --stop-price");
+        }
+        if (limitPrice !== undefined) {
+          throw new Error("--limit-price is not used with --order stop_market");
+        }
+      }
       const sid = await resolveSecurityIdArg(token, bundle, chosen);
-      const [securityPayload, restrictionsPayload] = await Promise.all([
-        graphqlRequest(token, "FetchSecurity", FETCH_SECURITY, { securityId: sid }, bundle),
-        graphqlRequest(token, "FetchSoOrdersLimitOrderRestrictions", FETCH_SO_ORDERS_LIMIT_ORDER_RESTRICTIONS, {
+      const securityPayload = await graphqlRequest(token, "FetchSecurity", FETCH_SECURITY, { securityId: sid }, bundle);
+      let restrictionsPayload: Record<string, unknown> | null = null;
+      let restrictionsWarning: string | null = null;
+      try {
+        restrictionsPayload = await graphqlRequest(token, "FetchSoOrdersLimitOrderRestrictions", FETCH_SO_ORDERS_LIMIT_ORDER_RESTRICTIONS, {
           args: { securityId: sid, side: "BUY" }
-        }, bundle)
-      ]);
+        }, bundle);
+      } catch (error) {
+        restrictionsWarning = error instanceof Error ? error.message : String(error);
+      }
       const out = {
         preview_only: true,
         no_submit: true,
@@ -1398,17 +1559,19 @@ async function main(): Promise<void> {
           shares,
           security_id: sid,
           limit_price: limitPrice ?? null,
+          stop_price: stopPrice ?? null,
           assumed_price_per_share_usd: cmdOpts.assumePrice ? Number.parseFloat(String(cmdOpts.assumePrice)) : null
         },
         result: {
           security_ok: true,
-          restrictions_ok: true,
+          restrictions_ok: restrictionsPayload !== null,
           ready_for_real_buy_command: true
         },
         graphql: {
           security: securityPayload,
           restrictions: restrictionsPayload
-        }
+        },
+        warnings: restrictionsWarning ? [restrictionsWarning] : []
       };
       print(out);
     });
@@ -1467,8 +1630,9 @@ async function main(): Promise<void> {
     .option("--security-id <id>")
     .option("--shares <n>")
     .option("--dollars <amount>")
-    .option("--order <type>", "market or limit", "market")
+    .option("--order <type>", "market, limit, stop_limit, or stop_market", "market")
     .option("--limit-price <n>", "Required when --order limit")
+    .option("--stop-price <n>", "Required when --order stop_limit")
     .option("--account-id <id>")
     .option("--account-type <type>")
     .option("--account-index <n>")
@@ -1493,25 +1657,49 @@ async function main(): Promise<void> {
       if ((shares === undefined) === (dollars === undefined)) {
         throw new Error("Provide exactly one of --shares or --dollars.");
       }
-      const orderStyle = String(cmdOpts.order ?? "market").trim().toLowerCase();
-      if (orderStyle !== "market" && orderStyle !== "limit") {
-        throw new Error("--order must be market or limit.");
+      const orderStyleRaw = String(cmdOpts.order ?? "market").trim().toLowerCase().replace("-", "_");
+      const orderStyle = orderStyleRaw === "stoplimit" ? "stop_limit" : orderStyleRaw;
+      if (!["market", "limit", "stop_limit", "stop_market"].includes(orderStyle)) {
+        throw new Error("--order must be market, limit, stop_limit, or stop_market.");
       }
       const limitPrice = cmdOpts.limitPrice !== undefined ? Number.parseFloat(String(cmdOpts.limitPrice)) : undefined;
+      const stopPrice = cmdOpts.stopPrice !== undefined ? Number.parseFloat(String(cmdOpts.stopPrice)) : undefined;
       if (orderStyle === "limit" && (limitPrice === undefined || !Number.isFinite(limitPrice) || limitPrice <= 0)) {
         throw new Error("limit orders require positive --limit-price.");
       }
-      if (orderStyle === "market" && limitPrice !== undefined) {
-        throw new Error("--limit-price can only be used with --order limit.");
+      if (orderStyle === "stop_limit") {
+        if (limitPrice === undefined || !Number.isFinite(limitPrice) || limitPrice <= 0) {
+          throw new Error("stop_limit orders require positive --limit-price.");
+        }
+        if (stopPrice === undefined || !Number.isFinite(stopPrice) || stopPrice <= 0) {
+          throw new Error("stop_limit orders require positive --stop-price.");
+        }
       }
-      if (orderStyle === "limit" && dollars !== undefined) {
-        throw new Error("limit buys currently require --shares (not --dollars).");
+      if (orderStyle === "stop_market") {
+        if (stopPrice === undefined || !Number.isFinite(stopPrice) || stopPrice <= 0) {
+          throw new Error("stop_market orders require positive --stop-price.");
+        }
+        if (limitPrice !== undefined) {
+          throw new Error("--limit-price is not used with --order stop_market.");
+        }
       }
-      if (orderStyle === "limit" && shares !== undefined && !Number.isInteger(shares)) {
-        throw new Error("limit buys require whole shares (fractional shares are not accepted).");
+      if (orderStyle === "market" && (limitPrice !== undefined || stopPrice !== undefined)) {
+        throw new Error("--limit-price/--stop-price can only be used with --order limit, --order stop_limit, or --order stop_market.");
+      }
+      if (orderStyle === "stop_market" && limitPrice !== undefined) {
+        throw new Error("--limit-price cannot be used with --order stop_market.");
+      }
+      if (orderStyle === "limit" && stopPrice !== undefined) {
+        throw new Error("--stop-price can only be used with --order stop_limit.");
+      }
+      if ((orderStyle === "limit" || orderStyle === "stop_limit" || orderStyle === "stop_market") && dollars !== undefined) {
+        throw new Error("limit, stop_limit, and stop_market buys require --shares (not --dollars).");
+      }
+      if ((orderStyle === "limit" || orderStyle === "stop_limit" || orderStyle === "stop_market") && shares !== undefined && !Number.isInteger(shares)) {
+        throw new Error("limit, stop_limit, and stop_market buys require whole shares (fractional shares are not accepted).");
       }
       let accountCurrency: string | null = null;
-      if (orderStyle === "limit" && shares !== undefined && limitPrice !== undefined) {
+      if ((orderStyle === "limit" || orderStyle === "stop_limit") && shares !== undefined && limitPrice !== undefined) {
         const accounts = await listAccounts(token, bundle);
         const account = accounts.find((row) => String(row.id ?? "") === accountId);
         const liquid = Number((account?.liquid_to_buy as Record<string, unknown> | undefined)?.amount);
@@ -1531,14 +1719,27 @@ async function main(): Promise<void> {
       const input: Record<string, unknown> = {
         canonicalAccountId: accountId,
         externalId,
-        executionType: shares && shares % 1 !== 0 ? "FRACTIONAL" : dollars ? "FRACTIONAL" : "REGULAR",
+        executionType:
+          orderStyle === "limit"
+            ? "LIMIT"
+            : orderStyle === "stop_limit"
+              ? "STOP_LIMIT"
+              : orderStyle === "stop_market"
+                ? "STOP"
+              : shares && shares % 1 !== 0
+                ? "FRACTIONAL"
+                : dollars
+                  ? "FRACTIONAL"
+                  : "REGULAR",
         orderType: dollars ? "BUY_VALUE" : "BUY_QUANTITY",
         securityId: resolvedSecurityId,
-        timeInForce: orderStyle === "limit" || (shares && shares % 1 === 0) ? "DAY" : null
+        timeInForce: shares && shares % 1 === 0 ? "DAY" : null
       };
+      if (orderStyle === "limit" || orderStyle === "stop_limit" || orderStyle === "stop_market") input.tradingSession = "REGULAR";
       if (shares !== undefined) input.quantity = shares;
       if (dollars !== undefined) input.value = dollars;
       if (limitPrice !== undefined) input.limitPrice = limitPrice;
+      if (stopPrice !== undefined) input.stopPrice = stopPrice;
       appendLog({
         event: "buy_submit_attempt",
         status: "start",
@@ -1549,6 +1750,7 @@ async function main(): Promise<void> {
         execution_type: input.executionType,
         order_type: input.orderType,
         limit_price: input.limitPrice ?? null,
+        stop_price: input.stopPrice ?? null,
         account_currency: accountCurrency,
         quantity: input.quantity ?? null,
         value: input.value ?? null
@@ -1583,9 +1785,10 @@ async function main(): Promise<void> {
         order_id: String(createdOrder.orderId ?? ""),
         created_at: createdOrder.createdAt ?? null
       });
-      const order = await waitForOrderStatus(token, externalId);
-      assertBuyOrderNotRejected(order);
+      const order = await waitForOrderStatus(token, externalId, 30, orderStyle === "stop_limit" || orderStyle === "stop_market");
+      assertOrderNotRejected(order);
       appendBuyHistory({
+        side: "buy",
         status: String(order.status ?? "unknown"),
         symbol: symbol || null,
         security_id: resolvedSecurityId,
@@ -1602,14 +1805,18 @@ async function main(): Promise<void> {
 
   program
     .command("sell")
+    .argument("[target]", "Ticker or security id")
     .option("--symbol <ticker>")
     .option("--security-id <id>")
     .option("--shares <n>")
+    .option("--sell-all", "Sell full symbol position using live positions or history fallback")
+    .option("--order <type>", "market or limit", "market")
+    .option("--limit-price <n>", "Required when --order limit")
     .option("--account-id <id>")
     .option("--account-type <type>")
     .option("--account-index <n>")
     .option("--confirm", "Required safety latch")
-    .action(async (cmdOpts: Record<string, string | boolean | undefined>) => {
+    .action(async (target: string | undefined, cmdOpts: Record<string, string | boolean | undefined>) => {
       if (!cmdOpts.confirm) throw new Error("Missing --confirm safety latch.");
       const opts = program.opts<GlobalOptions>();
       const { token, bundle } = await resolveAccessToken(opts);
@@ -1620,47 +1827,253 @@ async function main(): Promise<void> {
         cmdOpts.accountType as string | undefined,
         cmdOpts.accountIndex ? Number.parseInt(String(cmdOpts.accountIndex), 10) : undefined
       );
-      const shares = Number.parseFloat(String(cmdOpts.shares ?? ""));
-      if (!Number.isFinite(shares) || shares <= 0) throw new Error("--shares must be a positive number.");
-      let securityId = String(cmdOpts.securityId ?? "");
-      if (!securityId) {
-        const symbol = String(cmdOpts.symbol ?? "");
-        if (!symbol) throw new Error("Provide --security-id or --symbol.");
-        const search = await tradeRequest(token, "GET", `/securities?query=${encodeURIComponent(symbol)}`) as Record<string, unknown>;
-        securityId = String(((search.results as Record<string, unknown>[])[0] ?? {}).id ?? "");
+      const symbol = String(cmdOpts.symbol ?? target ?? "").trim();
+      const securityId = String(cmdOpts.securityId ?? "").trim();
+      if (!securityId && !symbol) throw new Error("Provide --security-id or ticker/symbol.");
+      const resolvedSecurityId = securityId || await resolveSecurityIdArg(token, bundle, symbol);
+      const resolvedSymbol = symbol ? symbol.toUpperCase() : await resolveSymbolFromSecurityId(token, bundle, resolvedSecurityId);
+      const hasShares = cmdOpts.shares !== undefined;
+      const sellAll = cmdOpts.sellAll === true;
+      if (hasShares === sellAll) {
+        throw new Error("Provide exactly one of --shares or --sell-all.");
       }
-      if (!securityId) throw new Error("Could not resolve security id.");
-      const security = await tradeRequest(token, "GET", `/securities/${securityId}`) as Record<string, unknown>;
-      const quote = (security.quote as Record<string, unknown> | undefined)?.amount;
-      if (quote === undefined || quote === null) throw new Error("Missing quote amount for market sell.");
-      const payload = await tradeRequest(token, "POST", "/orders", {
+      let shares: number;
+      if (sellAll) {
+        const position = await resolvePositionQuantity(token, bundle, accountId, resolvedSecurityId, resolvedSymbol);
+        shares = position.resolvedQuantity;
+        if (!Number.isFinite(shares) || shares <= 0) {
+          throw new Error(`No sellable ${resolvedSymbol} shares found for --sell-all.`);
+        }
+      } else {
+        shares = Number.parseFloat(String(cmdOpts.shares ?? ""));
+        if (!Number.isFinite(shares) || shares <= 0) throw new Error("--shares must be a positive number.");
+      }
+      const orderStyle = String(cmdOpts.order ?? "market").trim().toLowerCase();
+      if (orderStyle !== "market" && orderStyle !== "limit") {
+        throw new Error("--order must be market or limit.");
+      }
+      const limitPrice = cmdOpts.limitPrice !== undefined ? Number.parseFloat(String(cmdOpts.limitPrice)) : undefined;
+      if (orderStyle === "limit" && (limitPrice === undefined || !Number.isFinite(limitPrice) || limitPrice <= 0)) {
+        throw new Error("limit orders require positive --limit-price.");
+      }
+      if (orderStyle === "market" && limitPrice !== undefined) {
+        throw new Error("--limit-price can only be used with --order limit.");
+      }
+      if (orderStyle === "limit" && !Number.isInteger(shares)) {
+        throw new Error("limit sells require whole shares.");
+      }
+      const externalId = `order-${crypto.randomUUID()}`;
+      const input: Record<string, unknown> = {
+        canonicalAccountId: accountId,
+        externalId,
+        executionType: orderStyle === "limit" ? "LIMIT" : shares % 1 !== 0 ? "FRACTIONAL" : "REGULAR",
+        orderType: "SELL_QUANTITY",
+        securityId: resolvedSecurityId,
+        timeInForce: shares % 1 === 0 ? "DAY" : null
+      };
+      if (shares !== undefined) input.quantity = shares;
+      if (orderStyle === "limit") input.tradingSession = "REGULAR";
+      if (limitPrice !== undefined) input.limitPrice = limitPrice;
+      const order = await submitAndWaitOrder(token, bundle, input, "sell_submit_attempt", {
         account_id: accountId,
-        security_id: securityId,
-        quantity: shares,
-        order_type: "sell_quantity",
-        order_sub_type: "market",
-        time_in_force: "day",
-        limit_price: Number(quote)
-      }) as Record<string, unknown>;
-      const orderId = String(payload.order_id ?? payload.id ?? "");
-      if (!orderId) throw new Error("Sell response missing order id.");
-      const orders = await tradeRequest(token, "GET", "/orders") as Record<string, unknown>;
-      const row = ((orders.results as Record<string, unknown>[]) ?? []).find(
-        (entry) => String(entry.order_id ?? entry.id ?? "") === orderId
-      );
+        security_id: resolvedSecurityId,
+        external_id: externalId,
+        order_style: orderStyle,
+        execution_type: input.executionType,
+        order_type: input.orderType,
+        limit_price: input.limitPrice ?? null,
+        quantity: input.quantity ?? null
+      });
       appendBuyHistory({
-        status: String((row ?? payload).status ?? "unknown"),
-        symbol: cmdOpts.symbol ? String(cmdOpts.symbol) : null,
-        security_id: securityId,
+        status: String(order.status ?? "unknown"),
+        side: "sell",
+        symbol: resolvedSymbol || null,
+        security_id: resolvedSecurityId,
         account_id: accountId,
-        order_id: orderId,
-        external_id: null,
+        order_id: String(order.orderId ?? order.id ?? ""),
+        external_id: externalId,
         submitted_quantity: shares,
         submitted_value: null,
-        filled_quantity: (row ?? payload).filled_quantity ?? null,
-        average_filled_price: (row ?? payload).average_filled_price ?? null
+        filled_quantity: order.filledQuantity ?? null,
+        average_filled_price: order.averageFilledPrice ?? null
       });
-      print(row ?? payload);
+      print(order);
+    });
+
+  program
+    .command("position-for-symbol")
+    .argument("<target>", "Ticker or security id")
+    .option("--account-id <id>")
+    .option("--account-type <type>")
+    .option("--account-index <n>")
+    .action(async (target: string, cmdOpts: { accountId?: string; accountType?: string; accountIndex?: string }) => {
+      const opts = program.opts<GlobalOptions>();
+      const { token, bundle } = await resolveAccessToken(opts);
+      const accountId = await resolveAccountId(
+        token,
+        bundle,
+        cmdOpts.accountId,
+        cmdOpts.accountType,
+        cmdOpts.accountIndex ? Number.parseInt(cmdOpts.accountIndex, 10) : undefined
+      );
+      const resolvedSecurityId = await resolveSecurityIdArg(token, bundle, target);
+      const resolvedSymbol = await resolveSymbolFromSecurityId(token, bundle, resolvedSecurityId);
+      const position = await resolvePositionQuantity(token, bundle, accountId, resolvedSecurityId, resolvedSymbol);
+      print({
+        account_id: accountId,
+        security_id: resolvedSecurityId,
+        symbol: resolvedSymbol,
+        live_quantity: position.liveQuantity,
+        fallback_quantity: position.fallbackQuantity,
+        resolved_quantity: position.resolvedQuantity,
+        source: position.source
+      });
+    });
+
+  program
+    .command("trade-smoke")
+    .argument("<target>", "Ticker or security id")
+    .option("--shares <n>", "Whole shares to test", "1")
+    .requiredOption("--buy-limit-price <n>", "Limit price for buy step")
+    .option("--sell-limit-price <n>", "Limit price for sell step (defaults to buy price)")
+    .option("--account-id <id>")
+    .option("--account-type <type>")
+    .option("--account-index <n>")
+    .option("--confirm", "Required safety latch")
+    .action(async (target: string, cmdOpts: Record<string, string | boolean | undefined>) => {
+      if (!cmdOpts.confirm) throw new Error("Missing --confirm safety latch.");
+      const opts = program.opts<GlobalOptions>();
+      const { token, bundle } = await resolveAccessToken(opts);
+      const accountId = await resolveAccountId(
+        token,
+        bundle,
+        cmdOpts.accountId as string | undefined,
+        cmdOpts.accountType as string | undefined,
+        cmdOpts.accountIndex ? Number.parseInt(String(cmdOpts.accountIndex), 10) : undefined
+      );
+      const shares = Number.parseFloat(String(cmdOpts.shares ?? "1"));
+      if (!Number.isFinite(shares) || shares <= 0 || !Number.isInteger(shares)) {
+        throw new Error("--shares must be a positive whole number.");
+      }
+      const buyLimitPrice = Number.parseFloat(String(cmdOpts.buyLimitPrice ?? ""));
+      if (!Number.isFinite(buyLimitPrice) || buyLimitPrice <= 0) {
+        throw new Error("--buy-limit-price must be positive.");
+      }
+      const sellLimitPrice = cmdOpts.sellLimitPrice !== undefined
+        ? Number.parseFloat(String(cmdOpts.sellLimitPrice))
+        : buyLimitPrice;
+      if (!Number.isFinite(sellLimitPrice) || sellLimitPrice <= 0) {
+        throw new Error("--sell-limit-price must be positive.");
+      }
+      const resolvedSecurityId = await resolveSecurityIdArg(token, bundle, target);
+      const resolvedSymbol = await resolveSymbolFromSecurityId(token, bundle, resolvedSecurityId);
+      const before = await resolvePositionQuantity(token, bundle, accountId, resolvedSecurityId, resolvedSymbol);
+
+      const buyExternalId = `order-${crypto.randomUUID()}`;
+      const buyInput: Record<string, unknown> = {
+        canonicalAccountId: accountId,
+        externalId: buyExternalId,
+        executionType: "LIMIT",
+        orderType: "BUY_QUANTITY",
+        securityId: resolvedSecurityId,
+        timeInForce: "DAY",
+        tradingSession: "REGULAR",
+        quantity: shares,
+        limitPrice: buyLimitPrice
+      };
+      const buyOrder = await submitAndWaitOrder(token, bundle, buyInput, "buy_submit_attempt", {
+        account_id: accountId,
+        security_id: resolvedSecurityId,
+        external_id: buyExternalId,
+        order_style: "limit",
+        execution_type: "LIMIT",
+        order_type: "BUY_QUANTITY",
+        limit_price: buyLimitPrice,
+        quantity: shares,
+        smoke_test: true
+      });
+      appendBuyHistory({
+        side: "buy",
+        status: String(buyOrder.status ?? "unknown"),
+        symbol: resolvedSymbol,
+        security_id: resolvedSecurityId,
+        account_id: accountId,
+        order_id: String(buyOrder.orderId ?? buyOrder.id ?? ""),
+        external_id: buyExternalId,
+        submitted_quantity: shares,
+        submitted_value: null,
+        filled_quantity: buyOrder.filledQuantity ?? null,
+        average_filled_price: buyOrder.averageFilledPrice ?? null
+      });
+
+      const afterBuy = await resolvePositionQuantity(token, bundle, accountId, resolvedSecurityId, resolvedSymbol);
+      const sellQuantity = afterBuy.resolvedQuantity;
+      if (sellQuantity <= 0) {
+        throw new Error("Buy step filled but no sellable quantity detected for sell step.");
+      }
+
+      const sellExternalId = `order-${crypto.randomUUID()}`;
+      const sellInput: Record<string, unknown> = {
+        canonicalAccountId: accountId,
+        externalId: sellExternalId,
+        executionType: "LIMIT",
+        orderType: "SELL_QUANTITY",
+        securityId: resolvedSecurityId,
+        timeInForce: "DAY",
+        tradingSession: "REGULAR",
+        quantity: sellQuantity,
+        limitPrice: sellLimitPrice
+      };
+      const sellOrder = await submitAndWaitOrder(token, bundle, sellInput, "sell_submit_attempt", {
+        account_id: accountId,
+        security_id: resolvedSecurityId,
+        external_id: sellExternalId,
+        order_style: "limit",
+        execution_type: "LIMIT",
+        order_type: "SELL_QUANTITY",
+        limit_price: sellLimitPrice,
+        quantity: sellQuantity,
+        smoke_test: true
+      });
+      appendBuyHistory({
+        side: "sell",
+        status: String(sellOrder.status ?? "unknown"),
+        symbol: resolvedSymbol,
+        security_id: resolvedSecurityId,
+        account_id: accountId,
+        order_id: String(sellOrder.orderId ?? sellOrder.id ?? ""),
+        external_id: sellExternalId,
+        submitted_quantity: sellQuantity,
+        submitted_value: null,
+        filled_quantity: sellOrder.filledQuantity ?? null,
+        average_filled_price: sellOrder.averageFilledPrice ?? null
+      });
+
+      const afterSell = await resolvePositionQuantity(token, bundle, accountId, resolvedSecurityId, resolvedSymbol);
+      const pass = afterSell.resolvedQuantity <= 0;
+      print({
+        pass,
+        account_id: accountId,
+        security_id: resolvedSecurityId,
+        symbol: resolvedSymbol,
+        before,
+        buy: {
+          shares,
+          limit_price: buyLimitPrice,
+          status: buyOrder.status,
+          filled_quantity: buyOrder.filledQuantity ?? null,
+          average_filled_price: buyOrder.averageFilledPrice ?? null
+        },
+        after_buy: afterBuy,
+        sell: {
+          shares: sellQuantity,
+          limit_price: sellLimitPrice,
+          status: sellOrder.status,
+          filled_quantity: sellOrder.filledQuantity ?? null,
+          average_filled_price: sellOrder.averageFilledPrice ?? null
+        },
+        after_sell: afterSell
+      });
     });
 
   program

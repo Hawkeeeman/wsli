@@ -1,6 +1,6 @@
 # wsli
 
-CLI for Wealthsimple: read-only GraphQL and Trade REST (accounts, positions, portfolio, funding), `preview-buy`, and market **buy** / **sell** with `--confirm`. Node 20+. Repo: [github.com/Hawkeeeman/wsli](https://github.com/Hawkeeeman/wsli).
+CLI for Wealthsimple: read-only GraphQL and Trade REST (accounts, positions, portfolio, funding), `preview-buy`, live **buy** (market/limit), and **sell** with `--confirm`. Node 20+. Repo: [github.com/Hawkeeeman/wsli](https://github.com/Hawkeeeman/wsli).
 
 ## Install
 
@@ -35,8 +35,10 @@ Use `./wsli --help` and `./wsli <command> --help` for details.
 |------|----------|
 | Session | `setup`, `snippet`, `import-session`, `config-path`, `session-path`, `ping`, `keepalive` |
 | Market data | `lookup`, `security`, `restrictions` |
-| Account | `accounts`, `positions`, `portfolio`, `funding` |
-| Orders | `preview-buy` (read-only), `buy`, `sell` (`--confirm` required for live orders) |
+| Account | `accounts`, `positions`, `position-for-symbol`, `portfolio`, `funding` |
+| Orders | `preview-buy` (read-only), `buy` (supports `--order market|limit|stop_limit|stop_market`, with `--stop-price` for stop orders), `sell` (supports `--order market|limit`, `--sell-all`, `--confirm` required), `trade-smoke` |
+
+For `buy --order limit`, `buy --order stop_limit`, and `buy --order stop_market`, use whole shares (`--shares` integer). Stop-limit requires both `--stop-price` and `--limit-price`; stop-market requires only `--stop-price`.
 | Diagnostics | `logs`, `history` |
 
 ## Flags and environment
