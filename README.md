@@ -1,51 +1,49 @@
 # wsli
 
-Source: [github.com/Hawkeeeman/wsli](https://github.com/Hawkeeeman/wsli).
-
-Wealthsimple CLI (Node.js): read-only GraphQL, Trade REST for accounts / positions / portfolio / funding, read-only `preview-buy`, and real market **buy** / **sell** with `--confirm`.
-
-## Requirements
-
-- [Node.js](https://nodejs.org/) 20+
+CLI for Wealthsimple: read-only GraphQL and Trade REST (accounts, positions, portfolio, funding), `preview-buy`, and market **buy** / **sell** with `--confirm`. Node 20+. Repo: [github.com/Hawkeeeman/wsli](https://github.com/Hawkeeeman/wsli).
 
 ## Install
-
-Clone (HTTPS or SSH), then from that directory:
 
 ```bash
 git clone https://github.com/Hawkeeeman/wsli.git
 cd wsli
 npm install
-./wsli --help
 ```
 
-This repo includes a root **`wsli`** script (and **`wsli.mjs`**, the same logic) that rebuilds from `src/` when `dist/` is missing or stale, then runs the CLI. Add the **clone directory** to your `PATH` if you want the bare `wsli` command everywhere (then open a new shell or `source ~/.zshrc`).
+The root **`wsli`** script (same behavior as **`wsli.mjs`**) rebuilds from `src/` when `dist/` is missing or stale, then runs the CLI.
 
-**`zsh: command not found: wsli`** — until the repo is on `PATH`, from this directory use any of:
+## Run
+
+From the repo directory (no `PATH` setup). If the shell says `command not found: wsli`, use `./wsli` or `npm run wsli --` instead of bare `wsli`.
 
 ```bash
-./wsli ping --json
-npm run wsli -- ping --json
-npm exec wsli -- ping --json
+./wsli --help
+npm run wsli -- --help
 ```
 
-To use the bare `wsli` command: `npm link` in the repo root, then put npm’s global bin on your `PATH` (often `$(npm prefix -g)/bin`; check with `npm prefix -g`). Or: `npm install -g .` from the repo, or `npm install -g wsli` once published.
+To type `wsli` from anywhere: add the clone directory to `PATH`, or run `npm link` in the repo and ensure npm’s global bin is on `PATH` (`npm prefix -g`). Alternatives: `npm install -g .` from the repo, or `npm install -g wsli` if published.
 
-## Credentials
+## Session
 
-OAuth bundle is stored at **`~/.config/wsli/session.json`** (see `wsli session-path`).
+Default session file: **`~/.config/wsli/session.json`**. Print the path: `wsli session-path`.
 
 ## Commands
 
-Run `./wsli --help` (or `npm run wsli -- --help`) and the same with `<command> --help`.
+Use `./wsli --help` and `./wsli <command> --help` for details.
 
-Core commands: `setup`, `onboard`, `snippet`, `config-path`, `session-path`, `import-session`, `ping`, `keepalive`, `lookup`, `security`, `restrictions`, `preview-buy`, `accounts`, `positions`, `portfolio`, `funding`, `buy`, `sell` (buy/sell require `--confirm`), `logs`, `history`.
+| Area | Commands |
+|------|----------|
+| Session | `setup`, `snippet`, `import-session`, `config-path`, `session-path`, `ping`, `keepalive` |
+| Market data | `lookup`, `security`, `restrictions` |
+| Account | `accounts`, `positions`, `portfolio`, `funding` |
+| Orders | `preview-buy` (read-only), `buy`, `sell` (`--confirm` required for live orders) |
+| Diagnostics | `logs`, `history` |
 
-## Env / flags
+## Flags and environment
 
-- `--token-file`, `--access-token`, `--refresh-token`, `--json`
-- `WEALTHSIMPLE_ACCESS_TOKEN`, `WEALTHSIMPLE_REFRESH_TOKEN`, `WEALTHSIMPLE_OAUTH_JSON`, `WEALTHSIMPLE_OAUTH_CLIENT_ID`
-- `WSLI_NO_REFRESH`: set to `1` / `true` to skip OAuth refresh
+CLI: `--token-file`, `--access-token`, `--refresh-token`. For JSON account summaries use `wsli accounts --json` (optional `--pretty`).
+
+Environment: `WEALTHSIMPLE_ACCESS_TOKEN`, `WEALTHSIMPLE_REFRESH_TOKEN`, `WEALTHSIMPLE_OAUTH_JSON`, `WEALTHSIMPLE_OAUTH_CLIENT_ID`. Set `WSLI_NO_REFRESH` to `1` or `true` to disable OAuth refresh.
 
 ## Develop
 

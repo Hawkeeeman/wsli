@@ -180,7 +180,6 @@ type GlobalOptions = {
   tokenFile?: string;
   accessToken?: string;
   refreshToken?: string;
-  json?: boolean;
 };
 
 const EXPORT_SESSION_SNIPPET = `(() => {
@@ -199,7 +198,9 @@ const EXPORT_SESSION_SNIPPET = `(() => {
       console.error("No access_token found in cookie payload.");
       return;
     }
-    console.log(JSON.stringify(out, null, 2));
+    console.log(\`access_token=\${out.access_token}\`);
+    if (out.refresh_token) console.log(\`refresh_token=\${out.refresh_token}\`);
+    if (out.client_id) console.log(\`client_id=\${out.client_id}\`);
   } catch (err) {
     console.error("Failed to parse cookie payload:", err);
   }
@@ -218,43 +219,69 @@ function writeJsonFile(filePath: string, data: unknown): void {
   writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
 
-function extractFirstJsonObject(raw: string): string {
+function parseSessionInput(raw: string): OAuthBundle {
   const text = raw.trim();
-  if (!text) throw new Error("No JSON input received.");
-  let start = text.indexOf("{");
-  while (start >= 0) {
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let i = start; i < text.length; i += 1) {
-      const ch = text[i];
-      if (inString) {
-        if (escaped) {
-          escaped = false;
-        } else if (ch === "\\") {
-          escaped = true;
-        } else if (ch === "\"") {
-          inString = false;
-        }
-        continue;
+  if (!text) throw new Error("No session input received.");
+  if (text.startsWith("{") && text.endsWith("}")) {
+    try {
+      const parsed = JSON.parse(text) as Record<string, unknown>;
+      const access = parsed.access_token;
+      if (typeof access !== "string" || !access.trim()) {
+        throw new Error("Session input must include access_token.");
       }
-      if (ch === "\"") {
-        inString = true;
-        continue;
+      const payload: OAuthBundle = { access_token: access.trim() };
+      if (typeof parsed.refresh_token === "string" && parsed.refresh_token.trim()) {
+        payload.refresh_token = parsed.refresh_token.trim();
       }
-      if (ch === "{") depth += 1;
-      if (ch === "}") {
-        depth -= 1;
-        if (depth === 0) {
-          const candidate = text.slice(start, i + 1);
-          JSON.parse(candidate);
-          return candidate;
-        }
+      if (typeof parsed.client_id === "string" && parsed.client_id.trim()) {
+        payload.client_id = parsed.client_id.trim();
       }
+      return payload;
+    } catch (err) {
+      if (err instanceof Error && err.message === "Session input must include access_token.") {
+        throw err;
+      }
+      throw new Error("Invalid JSON session input.");
     }
-    start = text.indexOf("{", start + 1);
   }
-  throw new Error("Could not parse a JSON object from input.");
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const payload: OAuthBundle = { access_token: "" };
+  for (const line of lines) {
+    const accessMatch = line.match(/(?:^|\s)access[_-]?token\s*=\s*(.+)$/i);
+    if (accessMatch?.[1]?.trim()) {
+      payload.access_token = accessMatch[1].trim();
+      continue;
+    }
+    const refreshMatch = line.match(/(?:^|\s)refresh[_-]?token\s*=\s*(.+)$/i);
+    if (refreshMatch?.[1]?.trim()) {
+      payload.refresh_token = refreshMatch[1].trim();
+      continue;
+    }
+    const clientMatch = line.match(/(?:^|\s)client[_-]?id\s*=\s*(.+)$/i);
+    if (clientMatch?.[1]?.trim()) {
+      payload.client_id = clientMatch[1].trim();
+      continue;
+    }
+    const splitAt = line.indexOf("=");
+    if (splitAt <= 0) continue;
+    const key = line.slice(0, splitAt).trim().toLowerCase();
+    const value = line.slice(splitAt + 1).trim();
+    if (!value) continue;
+    if (key === "access_token" || key === "access-token") payload.access_token = value;
+    if (key === "refresh_token" || key === "refresh-token") payload.refresh_token = value;
+    if (key === "client_id" || key === "client-id") payload.client_id = value;
+  }
+  if (!payload.access_token) {
+    if (lines.length === 1 && !lines[0].includes("=")) {
+      payload.access_token = lines[0];
+    } else {
+      throw new Error("Session input must include access_token.");
+    }
+  }
+  return payload;
 }
 
 async function readAllStdinInteractive(): Promise<string> {
@@ -409,12 +436,6 @@ async function resolveOAuthBundle(opts: GlobalOptions): Promise<OAuthBundle> {
     return fileBundle;
   }
 
-  if (process.env.WEALTHSIMPLE_OAUTH_JSON) {
-    const data = JSON.parse(process.env.WEALTHSIMPLE_OAUTH_JSON) as OAuthBundle;
-    if (!data.access_token) throw new Error("WEALTHSIMPLE_OAUTH_JSON must include access_token.");
-    return data;
-  }
-
   if (process.env.WEALTHSIMPLE_ACCESS_TOKEN) {
     return {
       access_token: process.env.WEALTHSIMPLE_ACCESS_TOKEN,
@@ -430,7 +451,7 @@ async function resolveOAuthBundle(opts: GlobalOptions): Promise<OAuthBundle> {
   if (sessionBundle) return sessionBundle;
 
   throw new Error(
-    "No credentials found. Run wsli setup or wsli import-session <tokens.json>, or set WEALTHSIMPLE_ACCESS_TOKEN. " +
+    "No credentials found. Run wsli setup or wsli import-session <tokens.txt>, or set WEALTHSIMPLE_ACCESS_TOKEN. " +
       `(Session file: ${SESSION_FILE}.)`
   );
 }
@@ -517,11 +538,7 @@ async function tradeRequest(
   return payload;
 }
 
-function print(data: unknown, asJson = false): void {
-  if (asJson) {
-    console.log(JSON.stringify(data, null, 2));
-    return;
-  }
+function print(data: unknown): void {
   console.log(JSON.stringify(data, null, 2));
 }
 
@@ -616,7 +633,82 @@ async function listAccounts(token: string, bundle: OAuthBundle): Promise<Record<
     cursor = String(pageInfo.endCursor ?? "");
     if (!cursor) break;
   }
+  for (const row of rows) {
+    const accountId = String(row.id ?? "");
+    if (!accountId) {
+      row.stocks_value = null;
+      row.liquid_to_buy = null;
+      continue;
+    }
+    try {
+      const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
+      const positions = (((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ??
+        []) as Record<string, unknown>[];
+      const stockValue = positions.reduce((sum, position) => {
+        const parsed = Number(position.value);
+        return Number.isFinite(parsed) ? sum + parsed : sum;
+      }, 0);
+      row.stocks_value = {
+        amount: stockValue.toFixed(2),
+        currency: String((row.current_balance as Record<string, unknown> | null)?.currency ?? row.currency ?? "").trim()
+      };
+      const currentBalanceAmount = Number((row.current_balance as Record<string, unknown> | null)?.amount);
+      row.liquid_to_buy = Number.isFinite(currentBalanceAmount)
+        ? {
+            amount: (currentBalanceAmount - stockValue).toFixed(2),
+            currency: String((row.current_balance as Record<string, unknown> | null)?.currency ?? row.currency ?? "").trim()
+          }
+        : null;
+    } catch {
+      row.stocks_value = null;
+      row.liquid_to_buy = null;
+    }
+  }
   return rows;
+}
+
+function formatMoneyDisplay(value: unknown): string {
+  if (value === null || value === undefined) return "—";
+  const o = value as Record<string, unknown>;
+  const amount = o.amount;
+  const currency = String(o.currency ?? "").trim();
+  if (amount === null || amount === undefined || amount === "") return "—";
+  const a = String(amount);
+  return currency ? `${a} ${currency}` : a;
+}
+
+const ACCOUNTS_LABEL_W = 20;
+
+function accountsKv(label: string, value: string): string {
+  const v = value.trim() === "" ? "—" : value.trim();
+  return `  ${label.padEnd(ACCOUNTS_LABEL_W)}  ${v}`;
+}
+
+function formatAccountsHuman(rows: Record<string, unknown>[]): string {
+  const legend =
+    "Open accounts only. Fields below match buy/sell --account-type (account_type).\n" +
+    "trade_custodian: yes = WS/TR branch (CLI can place orders here).\n" +
+    "liquid_to_buy is estimated as total balance minus current stock positions.\n";
+  const blocks = rows.map((row, i) => {
+    const n = i + 1;
+    const sep = `── Account ${n} of ${rows.length} ──`;
+    return [
+      "",
+      sep,
+      "",
+      accountsKv("id", String(row.id ?? "")),
+      accountsKv("nickname", String(row.nickname ?? "")),
+      accountsKv("account_type", String(row.account_type ?? "")),
+      accountsKv("unified_type", String(row.unified_account_type ?? "")),
+      accountsKv("currency", String(row.currency ?? "")),
+      accountsKv("balance", formatMoneyDisplay(row.current_balance)),
+      accountsKv("liquid_to_buy", formatMoneyDisplay(row.liquid_to_buy)),
+      accountsKv("in_stocks", formatMoneyDisplay(row.stocks_value)),
+      accountsKv("net_deposits", formatMoneyDisplay(row.net_deposits)),
+      accountsKv("trade_custodian", row.trade_custodian === true ? "yes" : "no")
+    ].join("\n");
+  });
+  return legend + blocks.join("\n") + "\n";
 }
 
 function normalizeAccountTypeSelector(value: string): string[] {
@@ -666,11 +758,70 @@ async function resolveSecurityIdArg(token: string, bundle: OAuthBundle, raw: str
       const stock = item.stock as Record<string, unknown> | undefined;
       return String(stock?.symbol ?? "").toUpperCase() === raw.toUpperCase();
     });
+    const looksLikeTicker = /^[A-Za-z][A-Za-z0-9.-]{0,9}$/.test(raw.trim());
+    if (!exact && looksLikeTicker) {
+      const sample = results
+        .slice(0, 5)
+        .map((item) => {
+          const stock = item.stock as Record<string, unknown> | undefined;
+          return String(stock?.symbol ?? "").trim();
+        })
+        .filter(Boolean)
+        .join(", ");
+      throw new Error(
+        `No exact ticker match for '${raw}'. Top matches: ${sample || "none"}. ` +
+          "Use an exact symbol or pass --security-id."
+      );
+    }
     const candidate = exact ?? results[0];
     const sid = String(candidate.id ?? "");
     if (!sid.startsWith("sec-s-")) throw new Error(`Could not resolve valid security id for '${raw}'.`);
     return sid;
   }
+}
+
+async function assertDollarBuyEligibleSecurity(token: string, bundle: OAuthBundle, securityId: string): Promise<void> {
+  const payload = await graphqlRequest(token, "FetchSecurity", FETCH_SECURITY, { securityId }, bundle);
+  const security = (payload.data as Record<string, unknown> | undefined)?.security as Record<string, unknown> | undefined;
+  if (!security) throw new Error("Could not load security details for dollar buy.");
+  const buyable = security.buyable === true;
+  const eligible = security.wsTradeEligible === true;
+  if (!buyable || !eligible) {
+    const reason = String(security.wsTradeIneligibilityReason ?? "").trim();
+    const stock = security.stock as Record<string, unknown> | undefined;
+    const sym = String(stock?.symbol ?? "").trim();
+    const name = String(stock?.name ?? "").trim();
+    const label = sym ? `${sym}${name ? ` (${name})` : ""}` : securityId;
+    throw new Error(
+      `Dollar buys are fractional buys; ${label} is not eligible for fractional trading right now ` +
+        `(buyable=${String(security.buyable)}, wsTradeEligible=${String(security.wsTradeEligible)}` +
+        `${reason ? `, reason=${reason}` : ""}). Use --shares for whole-share orders when supported, ` +
+        "or pick a fractional-eligible symbol."
+    );
+  }
+}
+
+function assertBuyOrderNotRejected(order: Record<string, unknown>): void {
+  const status = String(order.status ?? "").toLowerCase();
+  if (status !== "rejected") return;
+  const code = String(order.rejectionCode ?? "").trim();
+  const cause = String(order.rejectionCause ?? "").trim();
+  if (code === "submitted_quantity_zero") {
+    throw new Error(
+      "Order rejected: submitted quantity rounded to zero. " +
+        "This usually means the dollar amount is below the broker's minimum notional for that symbol " +
+        "(dollar buys still must map to a non-zero fractional share)."
+    );
+  }
+  if (code === "balance_insufficient_cash") {
+    throw new Error(
+      "Order rejected: insufficient trading cash for this order. " +
+        "Note: account balance shown in `wsli accounts` can differ from immediately available trading cash " +
+        "(holds/unsettled cash/etc.)." +
+        (cause ? ` Details: ${cause}` : "")
+    );
+  }
+  throw new Error(`Order rejected${code ? ` (${code})` : ""}.${cause ? ` ${cause}` : ""}`);
 }
 
 async function resolveAccountId(
@@ -707,10 +858,20 @@ async function resolveAccountId(
 async function waitForOrderStatus(token: string, externalId: string, timeoutSeconds = 30): Promise<Record<string, unknown>> {
   const deadline = Date.now() + timeoutSeconds * 1000;
   while (Date.now() < deadline) {
-    const payload = await graphqlRequest(token, "FetchSoOrdersExtendedOrder", FETCH_SO_ORDERS_EXTENDED_ORDER, {
-      branchId: "TR",
-      externalId
-    });
+    let payload: Record<string, unknown>;
+    try {
+      payload = await graphqlRequest(token, "FetchSoOrdersExtendedOrder", FETCH_SO_ORDERS_EXTENDED_ORDER, {
+        branchId: "TR",
+        externalId
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.includes('"code":"NOT_FOUND"')) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        continue;
+      }
+      throw error;
+    }
     const order = (payload.data as Record<string, unknown>)?.soOrdersExtendedOrder as Record<string, unknown> | undefined;
     if (order) {
       const status = String(order.status ?? "").toLowerCase();
@@ -727,8 +888,7 @@ function withGlobalOptions(command: Command): Command {
   return command
     .option("--token-file <path>", "JSON file containing OAuth bundle")
     .option("--access-token <jwt>", "Access token for this run")
-    .option("--refresh-token <token>", "Refresh token for this run")
-    .option("--json", "JSON output");
+    .option("--refresh-token <token>", "Refresh token for this run");
 }
 
 async function main(): Promise<void> {
@@ -751,12 +911,11 @@ async function main(): Promise<void> {
     console.error("Step 1: Open https://my.wealthsimple.com and sign in.");
     console.error("Step 2: Paste this snippet in DevTools Console and run it:\n");
     console.log(EXPORT_SESSION_SNIPPET);
-    console.error("\nStep 3: Paste the resulting JSON here and press Ctrl-D:\n");
+    console.error("\nStep 3: Paste the token lines here and press Ctrl-D:\n");
     const raw = await readAllStdinInteractive();
-    const parsedText = extractFirstJsonObject(raw);
-    const payload = JSON.parse(parsedText) as Record<string, unknown>;
+    const payload = parseSessionInput(raw);
     if (typeof payload.access_token !== "string" || !payload.access_token.trim()) {
-      throw new Error("Imported JSON is missing access_token.");
+      throw new Error("Session input is missing access_token.");
     }
     writeJsonFile(SESSION_FILE, payload);
     appendLog({ event: "session_import", status: "ok", source: "setup" });
@@ -772,15 +931,12 @@ async function main(): Promise<void> {
       console.log(EXPORT_SESSION_SNIPPET);
     });
 
-  program.command("onboard").description("Alias for setup").action(runSetup);
-
   program
     .command("import-session")
-    .argument("[file]", "JSON file with access_token")
+    .argument("[file]", "Text file with access_token")
     .action(async (file?: string) => {
       const content = file ? readFileSync(path.resolve(file), "utf-8") : await readAllStdinInteractive();
-      const parsedText = extractFirstJsonObject(content);
-      const payload = JSON.parse(parsedText) as Record<string, unknown>;
+      const payload = parseSessionInput(content);
       if (typeof payload.access_token !== "string" || !payload.access_token.trim()) {
         throw new Error("Session import requires access_token.");
       }
@@ -799,7 +955,7 @@ async function main(): Promise<void> {
     const exp = jwtExpUnix(token);
     const lifetime = exp !== null ? Math.max(0, Math.floor(exp - Date.now() / 1000)) : null;
     const out = { status: response.status, lifetime };
-    console.log(opts.json ? JSON.stringify(out, null, 2) : JSON.stringify(out));
+    console.log(JSON.stringify(out));
     if (!response.ok) process.exit(1);
   });
 
@@ -848,7 +1004,7 @@ async function main(): Promise<void> {
           status: "ok",
           expires_in: tokenInfo.expires_in ?? null
         });
-        print({ action: "probe", token_info: tokenInfo }, !!opts.json);
+        print({ action: "probe", token_info: tokenInfo });
       };
       if (cmdOpts.once) {
         await runCycle();
@@ -870,15 +1026,22 @@ async function main(): Promise<void> {
       const limit = Math.max(1, Math.min(50, Number.parseInt(cmdOpts.limit, 10) || 20));
       const payload = await tradeRequest(token, "GET", `/securities?query=${encodeURIComponent(query)}`) as Record<string, unknown>;
       const results = Array.isArray(payload.results) ? payload.results.slice(0, limit) : [];
-      print(results, !!opts.json);
+      print(results);
     });
 
-  program.command("accounts").action(async () => {
-    const opts = program.opts<GlobalOptions>();
-    const { token, bundle } = await resolveAccessToken(opts);
-    const rows = await listAccounts(token, bundle);
-    print(rows, !!opts.json);
-  });
+  program
+    .command("accounts")
+    .description("List open accounts (GraphQL) as readable blocks.")
+    .action(async () => {
+      const opts = program.opts<GlobalOptions>();
+      const { token, bundle } = await resolveAccessToken(opts);
+      const rows = await listAccounts(token, bundle);
+      if (!rows.length) {
+        console.error("No open accounts returned.");
+        return;
+      }
+      console.log(formatAccountsHuman(rows));
+    });
 
   program
     .command("security")
@@ -894,7 +1057,7 @@ async function main(): Promise<void> {
         currency: null,
         period: "ONE_DAY"
       }, bundle);
-      print(payload, !!opts.json);
+      print(payload);
     });
 
   program
@@ -912,7 +1075,7 @@ async function main(): Promise<void> {
           side
         }
       }, bundle);
-      print(payload, !!opts.json);
+      print(payload);
     });
 
   program
@@ -964,7 +1127,7 @@ async function main(): Promise<void> {
           restrictions: restrictionsPayload
         }
       };
-      print(out, !!opts.json);
+      print(out);
     });
 
   program
@@ -984,7 +1147,7 @@ async function main(): Promise<void> {
       );
       const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
       const positions = ((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ?? [];
-      print(positions, !!opts.json);
+      print(positions);
     });
 
   program.command("portfolio").action(async () => {
@@ -998,7 +1161,7 @@ async function main(): Promise<void> {
       const positions = ((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ?? [];
       out.push({ account, positions });
     }
-    print(out, !!opts.json);
+    print(out);
   });
 
   program.command("funding").action(async () => {
@@ -1011,7 +1174,7 @@ async function main(): Promise<void> {
       current_balance: row.current_balance,
       net_deposits: row.net_deposits
     }));
-    print(funding, !!opts.json);
+    print(funding);
   });
 
   program
@@ -1036,14 +1199,17 @@ async function main(): Promise<void> {
         cmdOpts.accountType as string | undefined,
         cmdOpts.accountIndex ? Number.parseInt(String(cmdOpts.accountIndex), 10) : undefined
       );
-      const symbol = String(cmdOpts.symbol ?? target ?? "");
-      const securityId = String(cmdOpts.securityId ?? "");
-      const resolvedSecurityId = securityId || String(((await tradeRequest(token, "GET", `/securities?query=${encodeURIComponent(symbol)}`) as Record<string, unknown>).results as Record<string, unknown>[])[0]?.id ?? "");
-      if (!resolvedSecurityId) throw new Error("Could not resolve security id.");
+      const symbol = String(cmdOpts.symbol ?? target ?? "").trim();
+      const securityId = String(cmdOpts.securityId ?? "").trim();
+      if (!securityId && !symbol) throw new Error("Provide --security-id or ticker/symbol.");
+      const resolvedSecurityId = securityId || await resolveSecurityIdArg(token, bundle, symbol);
       const shares = cmdOpts.shares ? Number.parseFloat(String(cmdOpts.shares)) : undefined;
       const dollars = cmdOpts.dollars ? Number.parseFloat(String(cmdOpts.dollars)) : undefined;
       if ((shares === undefined) === (dollars === undefined)) {
         throw new Error("Provide exactly one of --shares or --dollars.");
+      }
+      if (dollars !== undefined) {
+        await assertDollarBuyEligibleSecurity(token, bundle, resolvedSecurityId);
       }
       const externalId = `order-${crypto.randomUUID()}`;
       const input: Record<string, unknown> = {
@@ -1056,8 +1222,49 @@ async function main(): Promise<void> {
       };
       if (shares !== undefined) input.quantity = shares;
       if (dollars !== undefined) input.value = dollars;
-      await graphqlRequest(token, "SoOrdersOrderCreate", MUTATION_SO_ORDERS_ORDER_CREATE, { input }, bundle);
+      appendLog({
+        event: "buy_submit_attempt",
+        status: "start",
+        account_id: accountId,
+        security_id: resolvedSecurityId,
+        external_id: externalId,
+        execution_type: input.executionType,
+        order_type: input.orderType,
+        quantity: input.quantity ?? null,
+        value: input.value ?? null
+      });
+      const createPayload = await graphqlRequest(token, "SoOrdersOrderCreate", MUTATION_SO_ORDERS_ORDER_CREATE, { input }, bundle);
+      const createData = (createPayload.data as Record<string, unknown> | undefined)?.soOrdersCreateOrder as
+        | Record<string, unknown>
+        | undefined;
+      const createErrors = Array.isArray(createData?.errors) ? (createData?.errors as unknown[]) : [];
+      if (createErrors.length > 0) {
+        const first = (createErrors[0] ?? {}) as Record<string, unknown>;
+        const code = String(first.code ?? "unknown");
+        const message = String(first.message ?? "Order create failed.");
+        appendLog({
+          event: "buy_submit_attempt",
+          status: "rejected",
+          account_id: accountId,
+          security_id: resolvedSecurityId,
+          external_id: externalId,
+          rejection_code: code,
+          rejection_message: message
+        });
+        throw new Error(`Order create rejected (${code}): ${message}`);
+      }
+      const createdOrder = (createData?.order as Record<string, unknown> | undefined) ?? {};
+      appendLog({
+        event: "buy_submit_attempt",
+        status: "accepted",
+        account_id: accountId,
+        security_id: resolvedSecurityId,
+        external_id: externalId,
+        order_id: String(createdOrder.orderId ?? ""),
+        created_at: createdOrder.createdAt ?? null
+      });
       const order = await waitForOrderStatus(token, externalId);
+      assertBuyOrderNotRejected(order);
       appendBuyHistory({
         status: String(order.status ?? "unknown"),
         symbol: symbol || null,
@@ -1070,7 +1277,7 @@ async function main(): Promise<void> {
         filled_quantity: order.filledQuantity ?? null,
         average_filled_price: order.averageFilledPrice ?? null
       });
-      print(order, !!opts.json);
+      print(order);
     });
 
   program
@@ -1133,7 +1340,7 @@ async function main(): Promise<void> {
         filled_quantity: (row ?? payload).filled_quantity ?? null,
         average_filled_price: (row ?? payload).average_filled_price ?? null
       });
-      print(row ?? payload, !!opts.json);
+      print(row ?? payload);
     });
 
   program
@@ -1144,13 +1351,12 @@ async function main(): Promise<void> {
     .option("--since <span>", "Filter by age: 30m, 2h, 1d")
     .option("--clear", "Delete log file")
     .action((cmdOpts: { limit: string; level?: string; event?: string; since?: string; clear?: boolean }) => {
-      const opts = program.opts<GlobalOptions>();
       if (cmdOpts.clear) {
         if (existsSync(LOG_FILE)) {
           writeFileSync(LOG_FILE, "", "utf-8");
-          print({ deleted: [LOG_FILE], missing: [] }, !!opts.json);
+          print({ deleted: [LOG_FILE], missing: [] });
         } else {
-          print({ deleted: [], missing: [LOG_FILE] }, !!opts.json);
+          print({ deleted: [], missing: [LOG_FILE] });
         }
         return;
       }
@@ -1170,7 +1376,7 @@ async function main(): Promise<void> {
         return true;
       });
       const output = filtered.length > limit ? filtered.slice(-limit) : filtered;
-      print({ path: LOG_FILE, entries: output }, !!opts.json);
+      print({ path: LOG_FILE, entries: output });
     });
 
   program
@@ -1182,13 +1388,12 @@ async function main(): Promise<void> {
     .option("--since <span>", "Filter by age: 30m, 2h, 1d")
     .option("--clear", "Delete history file")
     .action((cmdOpts: { limit: string; symbol?: string; status?: string; accountId?: string; since?: string; clear?: boolean }) => {
-      const opts = program.opts<GlobalOptions>();
       if (cmdOpts.clear) {
         if (existsSync(BUY_HISTORY_FILE)) {
           writeFileSync(BUY_HISTORY_FILE, "", "utf-8");
-          print({ deleted: [BUY_HISTORY_FILE], missing: [] }, !!opts.json);
+          print({ deleted: [BUY_HISTORY_FILE], missing: [] });
         } else {
-          print({ deleted: [], missing: [BUY_HISTORY_FILE] }, !!opts.json);
+          print({ deleted: [], missing: [BUY_HISTORY_FILE] });
         }
         return;
       }
@@ -1210,7 +1415,7 @@ async function main(): Promise<void> {
         return true;
       });
       const output = filtered.length > limit ? filtered.slice(-limit) : filtered;
-      print({ path: BUY_HISTORY_FILE, entries: output }, !!opts.json);
+      print({ path: BUY_HISTORY_FILE, entries: output });
     });
 
   await program.parseAsync(process.argv);
