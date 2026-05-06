@@ -7,8 +7,17 @@ import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
 import readline from "node:readline";
+import { fileURLToPath } from "node:url";
 
-const VERSION = "0.2.1";
+const PACKAGE_JSON_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "package.json");
+const VERSION = (() => {
+  const parsed = JSON.parse(readFileSync(PACKAGE_JSON_PATH, "utf8")) as Record<string, unknown>;
+  const version = typeof parsed.version === "string" ? parsed.version.trim() : "";
+  if (!version) {
+    throw new Error(`Missing valid version in ${PACKAGE_JSON_PATH}`);
+  }
+  return version;
+})();
 const GRAPHQL_URL = "https://my.wealthsimple.com/graphql";
 const TRADE_SERVICE_BASE = "https://trade-service.wealthsimple.com";
 const OAUTH_TOKEN_URL = "https://api.production.wealthsimple.com/v1/oauth/v2/token";
