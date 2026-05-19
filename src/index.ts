@@ -19,7 +19,6 @@ const VERSION = (() => {
   return version;
 })();
 const GRAPHQL_URL = "https://my.wealthsimple.com/graphql";
-const TRADE_SERVICE_BASE = "https://trade-service.wealthsimple.com";
 const OAUTH_TOKEN_URL = "https://api.production.wealthsimple.com/v1/oauth/v2/token";
 const OAUTH_TOKEN_INFO_URL = "https://api.production.wealthsimple.com/v1/oauth/v2/token/info";
 const SESSION_INFO_URL = "https://api.production.wealthsimple.com/api/sessions";
@@ -842,28 +841,6 @@ async function graphqlRequest(
   return payload;
 }
 
-async function tradeRequest(
-  token: string,
-  method: string,
-  pathName: string,
-  body?: Record<string, unknown>
-): Promise<unknown> {
-  const response = await fetch(`${TRADE_SERVICE_BASE}${pathName}`, {
-    method,
-    headers: {
-      accept: "application/json",
-      "content-type": "application/json",
-      authorization: `Bearer ${token}`,
-      origin: "https://my.wealthsimple.com",
-      referer: "https://my.wealthsimple.com/"
-    },
-    ...(body ? { body: JSON.stringify(body) } : {})
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(`${pathName} HTTP ${response.status}: ${JSON.stringify(payload)}`);
-  return payload;
-}
-
 function print(data: unknown): void {
   console.log(JSON.stringify(data, null, 2));
 }
@@ -1663,6 +1640,31 @@ async function resolveSecurityIdArg(token: string, bundle: OAuthBundle, raw: str
   }
 }
 
+async function fetchChartBarQuotesOneDay(
+  token: string,
+  bundle: OAuthBundle,
+  securityId: string
+): Promise<{ tradingSession: string; payload: Record<string, unknown> }> {
+  const sessions = ["REGULAR", "OVERNIGHT"] as const;
+  let lastPayload: Record<string, unknown> | null = null;
+  for (const tradingSession of sessions) {
+    const payload = await graphqlRequest(token, "FetchIntraDayChartQuotes", FETCH_SECURITY_QUOTES, {
+      id: securityId,
+      date: null,
+      tradingSession,
+      currency: null,
+      period: "ONE_DAY"
+    }, bundle);
+    lastPayload = payload;
+    const security = (payload.data as Record<string, unknown> | undefined)?.security as Record<string, unknown> | undefined;
+    const bars = security?.chartBarQuotes;
+    if (Array.isArray(bars) && bars.length > 0) {
+      return { tradingSession, payload };
+    }
+  }
+  return { tradingSession: sessions[sessions.length - 1], payload: lastPayload as Record<string, unknown> };
+}
+
 async function assertDollarBuyEligibleSecurity(token: string, bundle: OAuthBundle, securityId: string): Promise<void> {
   const payload = await graphqlRequest(token, "FetchSecurity", FETCH_SECURITY, { securityId }, bundle);
   const security = (payload.data as Record<string, unknown> | undefined)?.security as Record<string, unknown> | undefined;
@@ -2326,22 +2328,26 @@ async function main(): Promise<void> {
     .action(async (query: string, cmdOpts: { limit: string }) => {
       const limit = Math.min(50, parsePositiveIntOption(cmdOpts.limit, "--limit", 20));
       const opts = program.opts<GlobalOptions>();
-      const { token } = await resolveAccessToken(opts);
-      let payload: Record<string, unknown>;
-      try {
-        payload = await tradeRequest(token, "GET", `/securities?query=${encodeURIComponent(query)}`) as Record<string, unknown>;
-      } catch (error) {
-        const message = errorMessage(error);
-        if (message.includes("HTTP 404")) {
-          throw new Error(
-            "Lookup endpoint is currently unavailable for this account/session. " +
-            "Use a security id directly or try again later."
-          );
-        }
-        throw contextualError("lookup request", { query, limit }, error);
-      }
-      const results = Array.isArray(payload.results) ? payload.results.slice(0, limit) : [];
-      print(results);
+      const { token, bundle } = await resolveAccessToken(opts);
+      const q = query.trim();
+      if (!q) throw new Error("lookup query cannot be empty.");
+      const payload = await graphqlRequest(token, "FetchSecuritySearchResult", FETCH_SECURITY_SEARCH, { query: q }, bundle);
+      const raw =
+        ((((payload.data as Record<string, unknown>)?.securitySearch as Record<string, unknown>)?.results) as
+          | Record<string, unknown>[]
+          | undefined) ?? [];
+      const rows = raw.slice(0, limit).map((row) => {
+        const stock = row.stock as Record<string, unknown> | undefined;
+        return {
+          id: row.id,
+          buyable: row.buyable,
+          status: row.status,
+          symbol: stock?.symbol ?? null,
+          name: stock?.name ?? null,
+          primary_exchange: stock?.primaryExchange ?? null
+        };
+      });
+      print(rows);
     });
 
   program
@@ -2360,19 +2366,26 @@ async function main(): Promise<void> {
 
   program
     .command("security")
-    .argument("<securityId>", "Wealthsimple security id (sec-s-...)")
-    .action(async (securityId: string) => {
+    .argument("<target>", "Ticker, TSX.SYMBOL, or Wealthsimple security id (sec-s-...)")
+    .option("--market <exchange>", "When resolving a ticker, disambiguate exchange (TSX, NYSE, NASDAQ)")
+    .action(async (target: string, cmdOpts: { market?: string }) => {
       const opts = program.opts<GlobalOptions>();
       const { token, bundle } = await resolveAccessToken(opts);
-      const sid = normalizeSecurityId(securityId);
-      const payload = await graphqlRequest(token, "FetchIntraDayChartQuotes", FETCH_SECURITY_QUOTES, {
-        id: sid,
-        date: null,
-        tradingSession: "OVERNIGHT",
-        currency: null,
-        period: "ONE_DAY"
-      }, bundle);
-      print(payload);
+      const trimmed = target.trim();
+      let sid: string;
+      try {
+        sid = normalizeSecurityId(trimmed);
+      } catch {
+        const parsed = parseMarketQualifiedTicker(trimmed);
+        const symbol = parsed.symbol || trimmed;
+        const market = String(cmdOpts.market ?? "").trim() || parsed.market || "";
+        sid = await resolveSecurityIdArg(token, bundle, symbol, market || undefined);
+      }
+      const { tradingSession, payload } = await fetchChartBarQuotesOneDay(token, bundle, sid);
+      print({
+        ...payload,
+        wsli: { resolved_security_id: sid, chart_trading_session: tradingSession }
+      });
     });
 
   program
