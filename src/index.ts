@@ -2191,7 +2191,7 @@ async function main(): Promise<void> {
 
   program
     .command("keepalive")
-    .option("--once", "Run one probe/refresh cycle and exit")
+    .option("--once", "Probe token health, refresh if possible, and exit")
     .action(async (cmdOpts: { once?: boolean }) => {
       const activeProbeMs = 75_000;
       const idleProbeMs = 150_000;
@@ -2277,10 +2277,13 @@ async function main(): Promise<void> {
             expiresIn = expUnix !== null ? Math.max(0, Math.floor(expUnix - Date.now() / 1000)) : 0;
           }
 
-          const forceRefresh = ["1", "true", "yes"].includes(
-            String(process.env.WSLI_KEEPALIVE_FORCE_REFRESH ?? "").trim().toLowerCase()
-          );
-          let shouldRefresh = forceRefresh || expiresIn <= refreshThresholdSeconds || authProbeFailed;
+          const forceRefresh =
+            cmdOpts.once ||
+            ["1", "true", "yes"].includes(
+              String(process.env.WSLI_KEEPALIVE_FORCE_REFRESH ?? "").trim().toLowerCase()
+            );
+          let shouldRefresh =
+            forceRefresh || expiresIn <= refreshThresholdSeconds || authProbeFailed;
           let forcePriority = expiresIn <= criticalThresholdSeconds;
           if (consecutiveAuthFailures >= degradedAuthFailures) {
             shouldRefresh = true;
