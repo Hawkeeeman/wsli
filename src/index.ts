@@ -240,11 +240,16 @@ type GlobalOptions = {
   refreshToken?: string;
 };
 
+const WSLI_SESSION_BEGIN = "--- WSLI_SESSION_BEGIN ---";
+const WSLI_SESSION_END = "--- WSLI_SESSION_END ---";
+
 const EXPORT_SESSION_SNIPPET = `(() => {
+  const BEGIN = "${WSLI_SESSION_BEGIN}";
+  const END = "${WSLI_SESSION_END}";
   const out = { access_token: "", refresh_token: "", client_id: "" };
   const cookie = document.cookie.match(/(?:^|;\\s*)_oauth2_access_v2=([^;]+)/);
   if (!cookie) {
-    console.error("Cookie _oauth2_access_v2 not found. Ensure you are logged in at my.wealthsimple.com.");
+    console.error("Cookie _oauth2_access_v2 not found. Log in at my.wealthsimple.com first.");
     return;
   }
   try {
@@ -253,27 +258,22 @@ const EXPORT_SESSION_SNIPPET = `(() => {
     if (typeof parsed.refresh_token === "string") out.refresh_token = parsed.refresh_token;
     if (typeof parsed.client_id === "string") out.client_id = parsed.client_id;
     if (!out.access_token) {
-      console.error("No access_token found in cookie payload.");
+      console.error("No access_token in cookie.");
       return;
     }
-    const rule = "══════════════════════════════════════════════════════════════════════";
-    console.log("");
-    console.log(rule);
-    console.log(" wsli — Copy these lines into wsli setup (paste the whole block)");
-    console.log(" Each credential line starts with access_token, refresh_token, or client_id.");
-    console.log(" access_token is required; refresh_token and client_id help keep you signed in.");
-    console.log(rule);
-    console.log("");
-    console.log("access_token=" + out.access_token);
-    if (out.refresh_token) console.log("refresh_token=" + out.refresh_token);
-    if (out.client_id) console.log("client_id=" + out.client_id);
-    console.log("");
-    console.log(rule);
-    console.log(" end wsli output — do not copy anything below this line");
-    console.log(rule);
-    console.log("");
+    const lines = [BEGIN, "access_token=" + out.access_token];
+    if (out.refresh_token) lines.push("refresh_token=" + out.refresh_token);
+    if (out.client_id) lines.push("client_id=" + out.client_id);
+    lines.push(END);
+    lines.push("");
+    lines.push("Copy this entire message into wsli setup (Step 3).");
+    const block = lines.join("\\n");
+    console.log(block);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(block).catch(function () {});
+    }
   } catch (err) {
-    console.error("Failed to parse cookie payload:", err);
+    console.error("Failed to read session cookie:", err);
   }
 })();`;
 
@@ -301,57 +301,131 @@ function writeJsonFile(filePath: string, data: unknown): void {
   writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
 
-function parseSessionInput(raw: string): OAuthBundle {
+function stripCredentialValue(value: string): string {
+  const trimmed = value.trim();
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    return trimmed.slice(1, -1).trim();
+  }
+  return trimmed;
+}
+
+/** Drop DevTools prefixes like `app-abc123.js:3645 ` before credential keys. */
+function normalizeCredentialPasteLine(line: string): string {
+  const trimmed = line.trim();
+  const cred = trimmed.match(
+    /((?:access[_-]?token|refresh[_-]?token|client[_-]?id)\s*[:=].*)$/i
+  );
+  return cred ? cred[1].trim() : trimmed;
+}
+
+function extractMarkedSessionBlock(raw: string): string | null {
+  const begin = raw.indexOf(WSLI_SESSION_BEGIN);
+  const end = raw.indexOf(WSLI_SESSION_END);
+  if (begin < 0 || end < 0 || end <= begin) return null;
+  return raw.slice(begin + WSLI_SESSION_BEGIN.length, end).trim();
+}
+
+function extractFirstJsonObject(raw: string): string {
   const text = raw.trim();
+  if (!text) throw new Error("No JSON input received.");
+  let start = text.indexOf("{");
+  while (start >= 0) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < text.length; i += 1) {
+      const ch = text[i];
+      if (inString) {
+        if (escaped) {
+          escaped = false;
+        } else if (ch === "\\") {
+          escaped = true;
+        } else if (ch === "\"") {
+          inString = false;
+        }
+        continue;
+      }
+      if (ch === "\"") {
+        inString = true;
+        continue;
+      }
+      if (ch === "{") depth += 1;
+      if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) {
+          const candidate = text.slice(start, i + 1);
+          JSON.parse(candidate);
+          return candidate;
+        }
+      }
+    }
+    start = text.indexOf("{", start + 1);
+  }
+  throw new Error("Could not parse a JSON object from input.");
+}
+
+function oauthBundleFromRecord(parsed: Record<string, unknown>): OAuthBundle {
+  const access = parsed.access_token;
+  if (typeof access !== "string" || !access.trim()) {
+    throw new Error("Session input must include access_token.");
+  }
+  const payload: OAuthBundle = { access_token: access.trim() };
+  if (typeof parsed.refresh_token === "string" && parsed.refresh_token.trim()) {
+    payload.refresh_token = parsed.refresh_token.trim();
+  }
+  if (typeof parsed.client_id === "string" && parsed.client_id.trim()) {
+    payload.client_id = parsed.client_id.trim();
+  }
+  assertPlausibleAccessToken(payload.access_token);
+  return payload;
+}
+
+function parseSessionInput(raw: string): OAuthBundle {
+  let text = raw.trim();
   if (!text) throw new Error("No session input received.");
-  if (text.startsWith("{") && text.endsWith("}")) {
+  const marked = extractMarkedSessionBlock(text);
+  if (marked) text = marked;
+  if (text.includes("{")) {
     try {
-      const parsed = JSON.parse(text) as Record<string, unknown>;
-      const access = parsed.access_token;
-      if (typeof access !== "string" || !access.trim()) {
-        throw new Error("Session input must include access_token.");
-      }
-      const payload: OAuthBundle = { access_token: access.trim() };
-      if (typeof parsed.refresh_token === "string" && parsed.refresh_token.trim()) {
-        payload.refresh_token = parsed.refresh_token.trim();
-      }
-      if (typeof parsed.client_id === "string" && parsed.client_id.trim()) {
-        payload.client_id = parsed.client_id.trim();
-      }
-      assertPlausibleAccessToken(payload.access_token);
-      return payload;
+      const jsonText = text.startsWith("{") ? text : extractFirstJsonObject(text);
+      return oauthBundleFromRecord(JSON.parse(jsonText) as Record<string, unknown>);
     } catch (err) {
       if (err instanceof Error && err.message === "Session input must include access_token.") {
         throw err;
       }
-      throw new Error("Invalid JSON session input.");
+      if (text.startsWith("{")) {
+        throw new Error("Invalid JSON session input.");
+      }
     }
   }
   const lines = text
     .split(/\r?\n/)
-    .map((line) => line.trim())
+    .map((line) => normalizeCredentialPasteLine(line))
     .filter(Boolean);
   const payload: OAuthBundle = { access_token: "" };
   for (const line of lines) {
-    const accessMatch = line.match(/(?:^|\s)access[_-]?token\s*=\s*(.+)$/i);
+    const accessMatch = line.match(/^access[_-]?token\s*[:=]\s*(.+)$/i);
     if (accessMatch?.[1]?.trim()) {
-      payload.access_token = accessMatch[1].trim();
+      payload.access_token = stripCredentialValue(accessMatch[1]);
       continue;
     }
-    const refreshMatch = line.match(/(?:^|\s)refresh[_-]?token\s*=\s*(.+)$/i);
+    const refreshMatch = line.match(/^refresh[_-]?token\s*[:=]\s*(.+)$/i);
     if (refreshMatch?.[1]?.trim()) {
-      payload.refresh_token = refreshMatch[1].trim();
+      payload.refresh_token = stripCredentialValue(refreshMatch[1]);
       continue;
     }
-    const clientMatch = line.match(/(?:^|\s)client[_-]?id\s*=\s*(.+)$/i);
+    const clientMatch = line.match(/^client[_-]?id\s*[:=]\s*(.+)$/i);
     if (clientMatch?.[1]?.trim()) {
-      payload.client_id = clientMatch[1].trim();
+      payload.client_id = stripCredentialValue(clientMatch[1]);
       continue;
     }
-    const splitAt = line.indexOf("=");
+    const splitAt = line.search(/[:=]/);
     if (splitAt <= 0) continue;
     const key = line.slice(0, splitAt).trim().toLowerCase();
-    const value = line.slice(splitAt + 1).trim();
+    const value = stripCredentialValue(line.slice(splitAt + 1));
     if (!value) continue;
     if (key === "access_token" || key === "access-token") payload.access_token = value;
     if (key === "refresh_token" || key === "refresh-token") payload.refresh_token = value;
@@ -593,16 +667,19 @@ function isProcessRunning(pid: number): boolean {
   }
 }
 
-function maybeStartKeepalive(bundle: OAuthBundle): void {
-  if (!bundle.refresh_token) return;
+function wsliEntryScript(): string {
+  return process.argv[1] || fileURLToPath(import.meta.url);
+}
+
+function maybeStartKeepalive(bundle: OAuthBundle): boolean {
+  if (!bundle.access_token?.trim()) return false;
   let existingPid = 0;
   if (existsSync(KEEPALIVE_PID_FILE)) {
     const raw = readFileSync(KEEPALIVE_PID_FILE, "utf-8").trim();
     existingPid = Number.parseInt(raw, 10);
   }
-  if (isProcessRunning(existingPid)) return;
-  const entryScript = process.argv[1];
-  if (!entryScript) return;
+  if (isProcessRunning(existingPid)) return true;
+  const entryScript = wsliEntryScript();
   const child = spawn(process.execPath, [entryScript, "keepalive"], {
     detached: true,
     stdio: "ignore"
@@ -610,6 +687,7 @@ function maybeStartKeepalive(bundle: OAuthBundle): void {
   child.unref();
   writeFileSync(KEEPALIVE_PID_FILE, `${child.pid}\n`, "utf-8");
   appendLog({ event: "auth_keeper_autostart", status: "ok", pid: child.pid });
+  return true;
 }
 
 function keepaliveStatus(): "Active" | "Inactive" {
@@ -653,15 +731,23 @@ async function sleepMs(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+let sessionInfoEndpointUnavailable: boolean | null = null;
+
 async function getSessionInfo(accessToken: string): Promise<Record<string, unknown> | null> {
+  if (sessionInfoEndpointUnavailable) return null;
   const response = await fetch(SESSION_INFO_URL, {
     headers: {
       accept: "application/json",
-      authorization: `Bearer ${accessToken}`
+      authorization: `Bearer ${accessToken}`,
+      origin: "https://my.wealthsimple.com",
+      referer: "https://my.wealthsimple.com/"
     }
   });
   const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-  if (response.status === 404) return null;
+  if (response.status === 404) {
+    sessionInfoEndpointUnavailable = true;
+    return null;
+  }
   if (!response.ok) {
     throw new Error(`session info HTTP ${response.status}: ${JSON.stringify(payload)}`);
   }
@@ -1996,8 +2082,9 @@ async function main(): Promise<void> {
     console.log(`${tone("Step 3", "yellow", true)}: Paste what the browser printed below.`);
     console.log("");
     console.log(
-      "Paste only the credential lines from the browser (between the horizontal rules), starting with access_token."
+      "Paste the whole browser console message (from --- WSLI_SESSION_BEGIN --- through --- WSLI_SESSION_END ---)."
     );
+    console.log("Or paste JSON / key=value lines. DevTools line prefixes are OK.");
     console.log("");
     console.log("When finished, press Enter on an empty line.");
     const raw = await readSessionInputUntilBlankLine();
@@ -2005,8 +2092,20 @@ async function main(): Promise<void> {
     await verifyAccessTokenWithApi(payload.access_token);
     writeJsonFile(SESSION_FILE, payload);
     appendLog({ event: "session_import", status: "ok", source: "setup" });
-    maybeStartKeepalive(payload);
+    const keepaliveStarted = maybeStartKeepalive(payload);
     console.log(tone(`Saved credentials to ${SESSION_FILE}`, "green", true));
+    if (!payload.refresh_token) {
+      console.log(
+        tone(
+          "Note: no refresh_token saved — re-run the browser snippet if keepalive cannot refresh later.",
+          "yellow",
+          true
+        )
+      );
+    }
+    console.log(
+      tone(`keepalive: ${keepaliveStarted ? keepaliveStatus() : "Inactive (autostart failed)"}`, "cyan", true)
+    );
   };
 
   program.command("setup").description("Interactive onboarding flow").action(runSetup);
@@ -2022,6 +2121,7 @@ async function main(): Promise<void> {
       appendLog({ event: "session_import", status: "ok", source: file ? "file" : "stdin" });
       maybeStartKeepalive(payload);
       console.log(`Saved session to ${SESSION_FILE}`);
+      console.log(`keepalive: ${keepaliveStatus()}`);
     });
 
   program.command("ping").action(async () => {
@@ -2293,14 +2393,14 @@ async function main(): Promise<void> {
           auth_failures: consecutiveAuthFailures
         });
         const refreshFlag = action === "refresh" ? (refreshVerified ? "yes" : "no") : "n/a";
-        const sessionFlag = sessionInfo === null ? "unavailable" : "ok";
+        const sessionFlag = sessionInfo === null ? "n/a" : "ok";
         const nextProbeSeconds = Math.floor(cadenceMs / 1000);
         const parts = [
           `action=${tone(action, "cyan", true)}`,
           `expires_in=${tone(`${expiresIn}s`, "blue", true)}`,
           `refresh_verified=${toneStatus(refreshFlag)}`,
           `idle_mode=${toneStatus(isIdle ? "yes" : "no")}`,
-          `session_info=${toneStatus(sessionFlag)}`,
+          `session_info=${sessionFlag === "n/a" ? tone(sessionFlag, "cyan") : toneStatus(sessionFlag)}`,
           `next_probe=${tone(`${nextProbeSeconds}s`, "magenta", true)}`,
           `probe_failures=${consecutiveProbeFailures > 0 ? tone(`${consecutiveProbeFailures}`, "yellow", true) : tone("0", "green", true)}`,
           `auth_failures=${consecutiveAuthFailures > 0 ? tone(`${consecutiveAuthFailures}`, "red", true) : tone("0", "green", true)}`

@@ -9,19 +9,28 @@ const dist = path.join(root, "dist", "index.js");
 const src = path.join(root, "src", "index.ts");
 const tscBin = path.join(root, "node_modules", ".bin", "tsc");
 const OLD_PING_SNIPPET = "print({ status: response.status, payload }";
+const OLD_LOOKUP_SNIPPET = "Lookup endpoint is currently unavailable";
 
-function distHasOldPing() {
-  if (!fs.existsSync(dist)) return false;
+function distSnippet(path, snippet) {
+  if (!fs.existsSync(path)) return false;
   try {
-    return fs.readFileSync(dist, "utf8").includes(OLD_PING_SNIPPET);
+    return fs.readFileSync(path, "utf8").includes(snippet);
   } catch {
     return false;
   }
 }
 
+function distHasOldPing() {
+  return distSnippet(dist, OLD_PING_SNIPPET);
+}
+
+function distHasOldLookup() {
+  return distSnippet(dist, OLD_LOOKUP_SNIPPET);
+}
+
 function needBuild() {
   if (!fs.existsSync(dist)) return true;
-  if (distHasOldPing()) return true;
+  if (distHasOldPing() || distHasOldLookup()) return true;
   if (!fs.existsSync(src)) return false;
   return fs.statSync(src).mtimeMs > fs.statSync(dist).mtimeMs;
 }
@@ -31,9 +40,12 @@ if (fs.existsSync(tscBin) && needBuild()) {
   if (r.status !== 0) process.exit(r.status ?? 1);
 }
 
-if (distHasOldPing()) {
+if (distHasOldPing() || distHasOldLookup()) {
+  const issue = distHasOldLookup()
+    ? "lookup still uses the removed trade-service /securities endpoint"
+    : "ping still prints token/info";
   console.error(
-    "wsli: outdated build (ping still prints token/info). From this repo run: npm install && npm run build. " +
+    `wsli: outdated build (${issue}). From this repo run: npm install && npm run build. ` +
       "If you use a global install, run npm install -g . here or npm update -g wsli after a new release."
   );
   process.exit(1);
