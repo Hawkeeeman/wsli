@@ -118,6 +118,65 @@ query FetchAccountPositions($accountId: ID!) {
 }
 `;
 
+const FETCH_ACCOUNTS_WITH_BALANCE = `
+query FetchAccountsWithBalance($ids: [String!]!, $type: BalanceType!) {
+  accounts(ids: $ids) {
+    id
+    custodianAccounts {
+      id
+      financials {
+        ... on CustodianAccountFinancialsSo {
+          balance(type: $type) {
+            quantity
+            securityId
+            __typename
+          }
+          __typename
+        }
+        __typename
+      }
+      __typename
+    }
+    __typename
+  }
+}
+`;
+
+const CASH_SECURITY_CAD = "sec-c-cad";
+const CASH_SECURITY_USD = "sec-c-usd";
+
+type TradingBalanceRow = { securityId: string; quantity: string };
+
+function isCashSecurityId(securityId: string): boolean {
+  return securityId === CASH_SECURITY_CAD || securityId === CASH_SECURITY_USD;
+}
+
+function isStockSecurityId(securityId: string): boolean {
+  return securityId.startsWith("sec-s-");
+}
+
+function aggregateTradingBalances(rows: TradingBalanceRow[]): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const row of rows) {
+    const securityId = String(row.securityId ?? "").trim();
+    const qty = Number(row.quantity);
+    if (!securityId || !Number.isFinite(qty) || qty <= 0) continue;
+    out.set(securityId, (out.get(securityId) ?? 0) + qty);
+  }
+  return out;
+}
+
+function latestQuotePrice(payload: Record<string, unknown>): { price: number; currency: string } | null {
+  const security = (payload.data as Record<string, unknown> | undefined)?.security as Record<string, unknown> | undefined;
+  const bars = security?.chartBarQuotes;
+  if (!Array.isArray(bars) || !bars.length) return null;
+  const last = bars[bars.length - 1] as Record<string, unknown>;
+  const price = Number(last.sessionPrice ?? last.price);
+  if (!Number.isFinite(price) || price <= 0) return null;
+  const currency = String(last.currency ?? "").trim().toUpperCase() || "CAD";
+  return { price, currency };
+}
+
 const FETCH_SECURITY = `
 query FetchSecurity($securityId: ID!) {
   security(id: $securityId) {
@@ -1267,6 +1326,170 @@ function ensureLogIds(rows: Record<string, unknown>[]): { rows: Record<string, u
   return { rows: normalized, updated };
 }
 
+function cashMoneyFromTradingBalances(
+  balances: Array<{ securityId?: string; quantity?: string }>,
+  currency: string
+): { amount: string; currency: string } | null {
+  const securityId = currency.toUpperCase() === "USD" ? CASH_SECURITY_USD : CASH_SECURITY_CAD;
+  let quantity = 0;
+  let found = false;
+  for (const row of balances) {
+    if (String(row.securityId ?? "") !== securityId) continue;
+    const parsed = Number(row.quantity);
+    if (!Number.isFinite(parsed)) continue;
+    quantity += parsed;
+    found = true;
+  }
+  if (!found) return null;
+  return { amount: quantity.toFixed(2), currency: currency.toUpperCase() };
+}
+
+async function fetchTradingBalancesByAccountIds(
+  token: string,
+  bundle: OAuthBundle,
+  accountIds: string[]
+): Promise<Map<string, TradingBalanceRow[]>> {
+  const out = new Map<string, TradingBalanceRow[]>();
+  const ids = [...new Set(accountIds.map((id) => id.trim()).filter(Boolean))];
+  if (!ids.length) return out;
+
+  const chunkSize = 25;
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    const payload = await graphqlRequest(token, "FetchAccountsWithBalance", FETCH_ACCOUNTS_WITH_BALANCE, {
+      ids: chunk,
+      type: "TRADING"
+    }, bundle);
+    const accounts = (payload.data as Record<string, unknown> | undefined)?.accounts as unknown[] | undefined;
+    for (const account of accounts ?? []) {
+      const accountRow = account as Record<string, unknown>;
+      const accountId = String(accountRow.id ?? "").trim();
+      if (!accountId) continue;
+      const balanceRows: TradingBalanceRow[] = [];
+      const custodianAccounts = (accountRow.custodianAccounts as unknown[]) ?? [];
+      for (const custodian of custodianAccounts) {
+        const financials = (custodian as Record<string, unknown>).financials as Record<string, unknown> | undefined;
+        const balances = (financials?.balance as unknown[]) ?? [];
+        for (const balance of balances) {
+          const row = balance as Record<string, unknown>;
+          const securityId = String(row.securityId ?? "").trim();
+          const quantity = String(row.quantity ?? "").trim();
+          if (!securityId || !quantity) continue;
+          const existing = balanceRows.find((entry) => entry.securityId === securityId);
+          if (existing) {
+            const sum = Number(existing.quantity) + Number(quantity);
+            existing.quantity = Number.isFinite(sum) ? sum.toFixed(4).replace(/0+$/, "").replace(/\.$/, "") : existing.quantity;
+          } else {
+            balanceRows.push({ securityId, quantity });
+          }
+        }
+      }
+      out.set(accountId, balanceRows);
+    }
+  }
+  return out;
+}
+
+async function fetchTradingCashByAccountIds(
+  token: string,
+  bundle: OAuthBundle,
+  accountIds: string[]
+): Promise<Map<string, TradingBalanceRow[]>> {
+  const all = await fetchTradingBalancesByAccountIds(token, bundle, accountIds);
+  const out = new Map<string, TradingBalanceRow[]>();
+  for (const [accountId, rows] of all) {
+    out.set(
+      accountId,
+      rows.filter((row) => isCashSecurityId(row.securityId))
+    );
+  }
+  return out;
+}
+
+async function fetchLegacyAccountPositions(
+  token: string,
+  bundle: OAuthBundle,
+  accountId: string
+): Promise<Record<string, unknown>[]> {
+  const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
+  return (((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ??
+    []) as Record<string, unknown>[];
+}
+
+async function enrichPositionsFromTradingBalances(
+  token: string,
+  bundle: OAuthBundle,
+  balanceRows: TradingBalanceRow[],
+  defaultCurrency: string
+): Promise<Record<string, unknown>[]> {
+  const stockQty = aggregateTradingBalances(balanceRows.filter((row) => isStockSecurityId(row.securityId)));
+  if (!stockQty.size) return [];
+
+  const positions: Record<string, unknown>[] = [];
+  for (const [securityId, quantity] of stockQty) {
+    const securityPayload = await graphqlRequest(token, "FetchSecurity", FETCH_SECURITY, { securityId }, bundle);
+    const security = (securityPayload.data as Record<string, unknown> | undefined)?.security as
+      | Record<string, unknown>
+      | undefined;
+    const stock = security?.stock as Record<string, unknown> | undefined;
+    const symbol = String(stock?.symbol ?? "").trim().toUpperCase();
+    const name = String(stock?.name ?? "").trim();
+
+    let value: number | null = null;
+    let currency = defaultCurrency;
+    try {
+      const { payload: quotePayload } = await fetchChartBarQuotesOneDay(token, bundle, securityId);
+      const quote = latestQuotePrice(quotePayload);
+      if (quote) {
+        value = quote.price * quantity;
+        currency = quote.currency;
+      }
+    } catch {
+      // value stays null; portfolio will skip zero/unknown value rows
+    }
+
+    positions.push({
+      id: securityId,
+      symbol,
+      name,
+      quantity,
+      value: value ?? null,
+      currency,
+      __typename: "Position"
+    });
+  }
+
+  return positions.sort((a, b) => String(a.symbol ?? "").localeCompare(String(b.symbol ?? "")));
+}
+
+async function fetchAccountPositions(
+  token: string,
+  bundle: OAuthBundle,
+  accountId: string,
+  defaultCurrency = "CAD",
+  balanceRows?: TradingBalanceRow[]
+): Promise<Record<string, unknown>[]> {
+  const rows = balanceRows ?? (await fetchTradingBalancesByAccountIds(token, bundle, [accountId])).get(accountId) ?? [];
+  const fromBalances = await enrichPositionsFromTradingBalances(token, bundle, rows, defaultCurrency);
+  if (fromBalances.length) return fromBalances;
+  return fetchLegacyAccountPositions(token, bundle, accountId);
+}
+
+async function fetchStockQuantityFromTradingBalances(
+  token: string,
+  bundle: OAuthBundle,
+  accountId: string,
+  securityId: string
+): Promise<number> {
+  const rows = (await fetchTradingBalancesByAccountIds(token, bundle, [accountId])).get(accountId) ?? [];
+  let qty = 0;
+  for (const row of rows) {
+    if (String(row.securityId ?? "").trim() !== securityId) continue;
+    qty += numericQuantity(row.quantity);
+  }
+  return qty;
+}
+
 async function listAccounts(token: string, bundle: OAuthBundle): Promise<Record<string, unknown>[]> {
   const identityId = identityIdFromToken(token) ?? (bundle.identity_canonical_id as string | undefined);
   if (!identityId) throw new Error("Could not resolve identity id from token.");
@@ -1309,35 +1532,74 @@ async function listAccounts(token: string, bundle: OAuthBundle): Promise<Record<
     cursor = String(pageInfo.endCursor ?? "");
     if (!cursor) break;
   }
+  const tradingBalancesByAccount = await fetchTradingBalancesByAccountIds(
+    token,
+    bundle,
+    rows.map((row) => String(row.id ?? ""))
+  );
+
   for (const row of rows) {
     const accountId = String(row.id ?? "");
+    const accountCurrency = String(row.currency ?? "").trim().toUpperCase()
+      || String((row.current_balance as Record<string, unknown> | null)?.currency ?? "").trim().toUpperCase()
+      || "CAD";
+
     if (!accountId) {
       row.stocks_value = null;
-      row.liquid_to_buy = null;
+      row.total_cash_available = null;
       continue;
     }
+
+    const tradingBalances = tradingBalancesByAccount.get(accountId) ?? [];
+    row.trading_balances = tradingBalances;
+    row.total_cash_available = cashMoneyFromTradingBalances(
+      tradingBalances.filter((entry) => isCashSecurityId(entry.securityId)),
+      accountCurrency
+    );
+
+    if (!row.total_cash_available && String(row.unified_account_type ?? "").toUpperCase() === "CASH") {
+      const balance = row.current_balance as Record<string, unknown> | null;
+      if (balance?.amount !== undefined && balance?.amount !== null && balance?.amount !== "") {
+        row.total_cash_available = {
+          amount: String(balance.amount),
+          currency: String(balance.currency ?? accountCurrency).trim().toUpperCase() || accountCurrency
+        };
+      }
+    }
+
     try {
-      const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
-      const positions = (((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ??
-        []) as Record<string, unknown>[];
-      const stockValue = positions.reduce((sum, position) => {
-        const parsed = Number(position.value);
-        return Number.isFinite(parsed) ? sum + parsed : sum;
-      }, 0);
-      row.stocks_value = {
-        amount: stockValue.toFixed(2),
-        currency: String((row.current_balance as Record<string, unknown> | null)?.currency ?? row.currency ?? "").trim()
-      };
-      const currentBalanceAmount = Number((row.current_balance as Record<string, unknown> | null)?.amount);
-      row.liquid_to_buy = Number.isFinite(currentBalanceAmount)
-        ? {
-            amount: (currentBalanceAmount - stockValue).toFixed(2),
-            currency: String((row.current_balance as Record<string, unknown> | null)?.currency ?? row.currency ?? "").trim()
-          }
-        : null;
+      const balanceParts = moneyParts(row.current_balance);
+      const cashParts = moneyParts(row.total_cash_available);
+      const stockRows = (tradingBalancesByAccount.get(accountId) ?? []).filter((entry) =>
+        isStockSecurityId(entry.securityId)
+      );
+      if (balanceParts && cashParts && balanceParts.currency === cashParts.currency) {
+        const invested = balanceParts.amount - cashParts.amount;
+        row.stocks_value = {
+          amount: (invested > 0.005 ? invested : 0).toFixed(2),
+          currency: balanceParts.currency
+        };
+      } else if (stockRows.length) {
+        const positions = await fetchAccountPositions(
+          token,
+          bundle,
+          accountId,
+          accountCurrency,
+          tradingBalancesByAccount.get(accountId)
+        );
+        const stockValue = positions.reduce((sum, position) => {
+          const parsed = Number(position.value);
+          return Number.isFinite(parsed) ? sum + parsed : sum;
+        }, 0);
+        row.stocks_value = {
+          amount: stockValue.toFixed(2),
+          currency: accountCurrency
+        };
+      } else {
+        row.stocks_value = { amount: "0.00", currency: accountCurrency };
+      }
     } catch {
       row.stocks_value = null;
-      row.liquid_to_buy = null;
     }
   }
   return rows;
@@ -1395,7 +1657,7 @@ function formatPortfolioHuman(
 ): string {
   const accountSummaries = rows.map(({ account, positions }) => {
     const balance = moneyParts(account.current_balance);
-    const cash = moneyParts(account.liquid_to_buy);
+    const cash = moneyParts(account.total_cash_available);
     const holdings = positions
       .map((position) => {
         const value = Number(position.value);
@@ -1480,7 +1742,7 @@ function formatAccountsHuman(rows: Record<string, unknown>[]): string {
   const legend =
     `${tone("Open accounts only.", "gray")} Fields below match buy/sell --account-type (account_type).\n` +
     `${tone("trade_custodian", "gray")}: yes = WS/TR branch (CLI can place orders here).\n` +
-    `${tone("liquid_to_buy", "gray")} is estimated as total balance minus current stock positions.\n`;
+    `${tone("total_cash_available", "gray")} is tradeable cash from Wealthsimple (TRADING balance for sec-c-cad / sec-c-usd).\n`;
   const blocks = rows.map((row, i) => {
     const n = i + 1;
     const sep = tone(`── Account ${n} of ${rows.length} ──`, "blue", true);
@@ -1495,7 +1757,7 @@ function formatAccountsHuman(rows: Record<string, unknown>[]): string {
       accountsKv("unified_type", String(row.unified_account_type ?? "")),
       accountsKv("currency", String(row.currency ?? "")),
       accountsKv("balance", formatMoneyDisplay(row.current_balance)),
-      accountsKv("liquid_to_buy", formatMoneyDisplay(row.liquid_to_buy)),
+      accountsKv("total_cash_available", formatMoneyDisplay(row.total_cash_available)),
       accountsKv("in_stocks", formatMoneyDisplay(row.stocks_value)),
       accountsKv("net_deposits", formatMoneyDisplay(row.net_deposits)),
       accountsKv("trade_custodian", tradeCustodian)
@@ -1572,6 +1834,36 @@ function selectorAliases(selector: string): string[] {
   return Object.entries(aliasMap)
     .filter(([, variants]) => variants.includes(normalized))
     .map(([key]) => key);
+}
+
+function filterAccountsByNickname(
+  accounts: Record<string, unknown>[],
+  query: string,
+  aliases?: Record<string, string>
+): Record<string, unknown>[] {
+  const trimmed = query.trim();
+  if (!trimmed) throw new Error("--nickname cannot be empty.");
+  const normalizedQuery = normalizeAccountSelectorText(trimmed);
+  const aliasAccountIds = new Set<string>();
+  if (aliases && normalizedQuery) {
+    for (const [accountId, alias] of Object.entries(aliases)) {
+      const normalizedAlias = normalizeAlias(alias);
+      if (normalizedAlias === normalizedQuery || normalizedAlias.includes(normalizedQuery)) {
+        aliasAccountIds.add(accountId);
+      }
+    }
+  }
+  const matches = accounts.filter((account) => {
+    const accountId = String(account.id ?? "");
+    if (accountId === trimmed) return true;
+    if (aliasAccountIds.has(accountId)) return true;
+    const nickname = normalizeAccountSelectorText(String(account.nickname ?? ""));
+    return Boolean(normalizedQuery && nickname.includes(normalizedQuery));
+  });
+  if (!matches.length) {
+    throw new Error(`No account matches --nickname '${query}'. Run 'wsli accounts' to see available nicknames.`);
+  }
+  return matches;
 }
 
 function accountMatchesSelector(account: Record<string, unknown>, selector: string): boolean {
@@ -1787,8 +2079,8 @@ function assertOrderNotRejected(order: Record<string, unknown>): void {
   if (code === "balance_insufficient_cash") {
     throw new Error(
       "Order rejected: insufficient trading cash for this order. " +
-        "Note: account balance shown in `wsli accounts` can differ from immediately available trading cash " +
-        "(holds/unsettled cash/etc.)." +
+        "Note: total_cash_available in `wsli accounts` is tradeable cash only and can differ from account balance " +
+        "(holds, unsettled cash, open orders, etc.)." +
         (cause ? ` Details: ${cause}` : "")
     );
   }
@@ -1878,13 +2170,25 @@ async function resolvePositionQuantity(
   const symbolUp = symbol.trim().toUpperCase();
   const fallbackQuantity = fallbackQuantityFromHistory(accountId, securityId, symbolUp);
   try {
+    const liveQuantity = await fetchStockQuantityFromTradingBalances(token, bundle, accountId, securityId);
+    if (liveQuantity > 0) {
+      return { liveQuantity, fallbackQuantity, resolvedQuantity: liveQuantity, source: "positions" };
+    }
     const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
     const positions = ((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ?? [];
     const livePosition = (positions as Record<string, unknown>[]).find(
       (row) => String(row.symbol ?? "").trim().toUpperCase() === symbolUp
     );
-    const liveQuantity = livePosition ? numericQuantity((livePosition as Record<string, unknown>).quantity) : 0;
-    return { liveQuantity, fallbackQuantity, resolvedQuantity: liveQuantity, source: "positions" };
+    const legacyQuantity = livePosition ? numericQuantity((livePosition as Record<string, unknown>).quantity) : 0;
+    if (legacyQuantity > 0) {
+      return { liveQuantity: legacyQuantity, fallbackQuantity, resolvedQuantity: legacyQuantity, source: "positions" };
+    }
+    return {
+      liveQuantity: 0,
+      fallbackQuantity,
+      resolvedQuantity: fallbackQuantity,
+      source: fallbackQuantity > 0 ? "history_fallback" : "positions"
+    };
   } catch {
     return { liveQuantity: 0, fallbackQuantity, resolvedQuantity: fallbackQuantity, source: "history_fallback" };
   }
@@ -2456,13 +2760,17 @@ async function main(): Promise<void> {
   program
     .command("accounts")
     .description("List open accounts (GraphQL) as readable blocks.")
-    .action(async () => {
+    .option("--nickname <text>", "Show only accounts whose nickname matches this text")
+    .action(async (cmdOpts: { nickname?: string }) => {
       const opts = program.opts<GlobalOptions>();
       const { token, bundle } = await resolveAccessToken(opts);
-      const rows = await listAccounts(token, bundle);
+      let rows = await listAccounts(token, bundle);
       if (!rows.length) {
         console.error("No open accounts returned.");
         return;
+      }
+      if (cmdOpts.nickname) {
+        rows = filterAccountsByNickname(rows, cmdOpts.nickname, readAccountAliases());
       }
       console.log(formatAccountsHuman(rows));
     });
@@ -2506,8 +2814,7 @@ async function main(): Promise<void> {
         cmdOpts.accountType,
         parseOptionalPositiveIntOption(cmdOpts.accountIndex, "--account-index")
       );
-      const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
-      const positions = ((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions ?? [];
+      const positions = await fetchAccountPositions(token, bundle, accountId);
       print(positions);
     });
 
@@ -2518,9 +2825,14 @@ async function main(): Promise<void> {
     const out: Array<{ account: Record<string, unknown>; positions: Record<string, unknown>[] }> = [];
     for (const account of accounts) {
       const accountId = String(account.id);
-      const payload = await graphqlRequest(token, "FetchAccountPositions", FETCH_ACCOUNT_POSITIONS, { accountId }, bundle);
-      const positions = ((((payload.data as Record<string, unknown>)?.account as Record<string, unknown>)?.positions) ??
-        []) as Record<string, unknown>[];
+      const currency = String(account.currency ?? "CAD").trim().toUpperCase() || "CAD";
+      const positions = await fetchAccountPositions(
+        token,
+        bundle,
+        accountId,
+        currency,
+        (account.trading_balances as TradingBalanceRow[] | undefined) ?? undefined
+      );
       out.push({ account, positions });
     }
     console.log(formatPortfolioHuman(out));
@@ -2757,8 +3069,8 @@ async function main(): Promise<void> {
       if ((orderStyle === "limit" || orderStyle === "stop_limit") && shares !== undefined && limitPrice !== undefined) {
         const accounts = await listAccounts(token, bundle);
         const account = accounts.find((row) => String(row.id ?? "") === accountId);
-        const liquid = Number((account?.liquid_to_buy as Record<string, unknown> | undefined)?.amount);
-        accountCurrency = String((account?.liquid_to_buy as Record<string, unknown> | undefined)?.currency ?? "").trim() || null;
+        const liquid = Number((account?.total_cash_available as Record<string, unknown> | undefined)?.amount);
+        accountCurrency = String((account?.total_cash_available as Record<string, unknown> | undefined)?.currency ?? "").trim() || null;
         const estimatedCost = shares * limitPrice;
         if (Number.isFinite(liquid) && accountCurrency === "USD" && liquid < estimatedCost) {
           throw new Error(
